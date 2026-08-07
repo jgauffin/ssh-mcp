@@ -7,6 +7,7 @@ import { HostRegistry } from './hosts/registry.js';
 import { ConnectionPool } from './session/pool.js';
 import { SudoGrants } from './sudo/grants.js';
 import { closeAllPages, type RoundState } from './vault/gate.js';
+import { setPagePort } from './vault/unlock-page.js';
 import { Vault } from './vault/vault.js';
 
 /**
@@ -32,6 +33,10 @@ export interface Runtime {
 export async function createRuntime(configPath?: string): Promise<Runtime> {
   const config = await loadConfig(configPath);
   const hosts = await HostRegistry.load(config);
+
+  // Before anything can open a page: the first one to open binds the port, and
+  // from then on this has no say.
+  setPagePort(config.pagePort);
 
   const vault = new Vault(
     hosts.all().map((host) => host.keyPath),

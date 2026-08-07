@@ -61,19 +61,32 @@ schema is stronger than validation: the model has nothing to pass. Tools declare
 ### A wildcard grant can only match a command whose meaning is pinned
 
 You approve `systemctl restart *` on `prod-1`. The model then runs
-`sudo systemctl restart nginx; rm -rf /var`. String matching on the prefix would
-let the whole line through, so instead:
+`sudo systemctl restart nginx; sudo rm -rf /var`. String matching on the prefix
+would hand the second command root as well, so instead:
 
 1. The line is split as a shell would split it, tracking quotes. Every separator
    (`;` `&&` `||` `|` `&`), expansion (`$(…)`, backticks, `${…}`, `$`) and
    redirection (`<` `>`) **outside** quotes is recorded.
-2. A stored rule only ever matches a line with none of those. Anything else is
-   approve-once, with the extras shown to you.
-3. Matching is per argument, not per substring. `*` is exactly one argument;
+2. Rules are matched **per sudo segment**, the way `sudoers` matches. A shell
+   resolves `;` and `|` before anything runs, so that line is two commands and
+   each `sudo` on it must find its own rule. `systemctl restart *` covers the
+   first and nothing covers `rm -rf /var`, so the line is put to you. Note what
+   this does *not* claim: appending a command that needs no sudo —
+   `sudo systemctl restart nginx; rm -rf ~/scratch` — is covered, because the
+   second half is an ordinary unprivileged command that `ssh_run` would have run
+   without asking anyway.
+3. An expansion or a redirection stops matching outright, for a different
+   reason: the argv a rule was matched against is then not the argv that runs.
+   `sudo systemctl restart $(cat /tmp/service)` is approve-once whatever the
+   policy says. So is `&` — output nobody sees is approval nobody can check.
+4. A **new** rule is only ever written from a plain single command: one segment,
+   one sudo, no separators at all. Matching a pipeline is fine; storing one is
+   not, because a rule is read back by a human months later.
+5. Matching is per argument, not per substring. `*` is exactly one argument;
    `**` is the remaining arguments, last position only. So
    `systemctl restart *` matches `systemctl restart nginx` and refuses
    `systemctl restart nginx --now`.
-4. `sudo`'s own flags are parsed. Anything not understood (a bundled `-nS`, an
+6. `sudo`'s own flags are parsed. Anything not understood (a bundled `-nS`, an
    unknown `--flag`) makes the invocation ungrantable rather than guessed at.
 
 `grep "a;b" /etc/hosts` is still a plain command; the `;` is quoted.
@@ -182,6 +195,13 @@ back through the client and into the model's context, which is the one thing a
 passphrase must not do. Set `open-browser = false` under `[approval]` to get
 only the link (headless boxes, remote sessions).
 
+Every page in a run is served from one port, `8765` by default. That is for your
+browser's benefit: it identifies a site by scheme, host *and* port, so a page
+that moved would be a new site each time — and each new site is asked afresh
+whether to save the passphrase it just watched you type. One fixed port makes
+"Never" mean never. A second ssh-mcp on the same machine steps up to `8766` and
+stays there. `page-port = 0` brings the old per-run random port back.
+
 **Known limit: protocol era.** Claude Code negotiates the 2025 protocol era
 over stdio, not `2026-07-28`, and does not declare URL-mode elicitation. No flag
 changes this; the client has to opt in. So multi-round-trip elicitation never
@@ -206,6 +226,9 @@ open-browser = true
 # default; useful while you are learning what the assistant does. (Sudo always
 # prompts, via ssh_sudo, and is not affected by this.)
 confirm-every-command = false
+# The loopback port every unlock and approval page is served on. Change it only
+# if something else on this machine wants 8765; see below for why it is fixed.
+page-port = 8765
 
 # Import connection details from an entry you already have.
 [hosts.prod-1]
@@ -283,7 +306,7 @@ You:    check nginx on prod-1
 Claude: [ssh_run prod-1 "systemctl status nginx"]
 
         ssh-mcp wants you to open:
-          http://127.0.0.1:49821/unlock/9nQ2…
+          http://127.0.0.1:8765/unlock/9nQ2…
           [open] [decline]
 ```
 
@@ -362,12 +385,14 @@ Two things catch people out, both from matching arguments rather than strings:
 
 - **Flags are arguments, and order matters.** `apt-get install **` covers
   `apt-get install -y nginx` and does *not* cover `apt-get -y install nginx`.
-- **A rule only matches a simple command line.** A pipe, a redirection, a `&&`
-  or a `$(…)` makes the line approve-once whatever the policy says (see
+- **A redirection or a `$(…)` makes the line approve-once**, whatever the policy
+  says, because what would run is not what the rule was matched against. Pipes
+  and `;` are fine — each sudo segment is matched on its own, so
+  `journalctl -u api | tail -50` runs on a `journalctl **` rule (see
   [A wildcard grant can only match a command whose meaning is
   pinned](#a-wildcard-grant-can-only-match-a-command-whose-meaning-is-pinned)).
-  Reach for a flag instead of a pipe: `journalctl -u api -n 50 --no-pager`
-  matches a rule, `journalctl -u api | tail -50` asks every time.
+  A rule is still only ever *written* from a plain single command, so the "allow
+  for the session" button does not appear on a pipeline.
 
 #### Rules that can never fire
 

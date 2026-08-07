@@ -155,6 +155,49 @@ describe('the approval page, when the decision is about a file', () => {
 });
 
 /**
+ * The browser decides whether it has seen a site before from the scheme, host
+ * and port — so a page on a fresh port every time is a fresh site every time,
+ * and Chrome offers to save the passphrase again for each one. "Never for this
+ * site" only sticks to a port that stays put.
+ */
+describe('where the pages are served', () => {
+  beforeEach(() => {
+    closeAllPages();
+    openedUrls.length = 0;
+  });
+
+  it('puts every page of a run on one port', async () => {
+    const first = new URL(await linkFrom());
+    const second = new URL(await linkFrom({ key: 'approve:lab:sudo systemctl restart nginx' }));
+
+    expect(first.port).toBe(second.port);
+    // And they are still separate pages — one listener, two nonces.
+    expect(first.pathname).not.toBe(second.pathname);
+  });
+
+  it('keeps that port across pages that have already been closed', async () => {
+    const before = new URL(await linkFrom());
+    closeAllPages();
+    const after = new URL(await linkFrom({ key: 'approve:lab:sudo systemctl restart nginx' }));
+
+    expect(after.port).toBe(before.port);
+  });
+
+  /**
+   * The listener outliving the page is the whole point, so a finished nonce has
+   * to stop resolving on its own — it is no longer protected by the socket
+   * closing behind it.
+   */
+  it('serves nothing at a closed page, though the port is still open', async () => {
+    const url = await linkFrom();
+    closeAllPages();
+
+    const response = await fetch(url);
+    expect(response.status).toBe(404);
+  });
+});
+
+/**
  * Closing the tab is the ordinary way to get a prompt wrong, and nothing over
  * HTTP can tell us it happened — the loopback listener stays up either way. So
  * a cached page looks perfectly alive while the user is looking at nothing.

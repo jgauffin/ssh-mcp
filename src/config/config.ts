@@ -62,6 +62,14 @@ const fileSchema = z
         'confirm-every-command': z.boolean().optional(),
         /** Open the unlock page in the default browser instead of only printing its link. */
         'open-browser': z.boolean().optional(),
+        /**
+         * The loopback port the unlock and approval pages are served on.
+         *
+         * Stable on purpose: the browser identifies a site by its port, so a
+         * moving port means being asked to save the passphrase on every page.
+         * `0` picks a free port per run and brings that back.
+         */
+        'page-port': z.number().int().min(0).max(65535).optional(),
       })
       .strict()
       .optional(),
@@ -70,6 +78,16 @@ const fileSchema = z
   .strict();
 
 const DEFAULT_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
+
+/**
+ * The port the unlock and approval pages are served on.
+ *
+ * Arbitrary, in the range nothing claims by convention. What matters is only
+ * that it does not move: the browser identifies a site by scheme, host *and*
+ * port, so a page that moves is a new site every time — and a new site is asked
+ * again whether to save the passphrase it just saw typed.
+ */
+export const DEFAULT_PAGE_PORT = 8765;
 
 export interface HostConfig {
   readonly alias: string;
@@ -93,6 +111,8 @@ export interface Config {
   readonly confirmEveryCommand: boolean;
   /** When true, the unlock page is opened in the default browser as well as linked. */
   readonly openBrowser: boolean;
+  /** Loopback port for the unlock and approval pages; `0` means a fresh one each run. */
+  readonly pagePort: number;
   readonly hosts: readonly HostConfig[];
 }
 
@@ -124,6 +144,11 @@ idle-timeout = "60m"     # relock (and drop sudo grants) after this much idle ti
 # Show Claude Code's permission dialog, with the full command in it, before every
 # run. Useful while you are learning what the assistant actually does.
 confirm-every-command = false
+
+# The loopback port the unlock and approval pages are served on. Keep it stable:
+# your browser treats a new port as a new site, and offers to save the passphrase
+# again for each one. Only change it if something else on this machine wants 8765.
+page-port = 8765
 
 [hosts.prod-1]
 from = "ssh-config:prod-1"   # import HostName/User/Port/IdentityFile from ~/.ssh/config
@@ -202,6 +227,7 @@ export async function loadConfig(path: string = defaultConfigPath()): Promise<Co
     idleTimeoutMs: result.data.vault?.['idle-timeout'] ?? DEFAULT_IDLE_TIMEOUT_MS,
     confirmEveryCommand: result.data.approval?.['confirm-every-command'] ?? false,
     openBrowser: result.data.approval?.['open-browser'] ?? true,
+    pagePort: result.data.approval?.['page-port'] ?? DEFAULT_PAGE_PORT,
     hosts,
   };
 }

@@ -51,9 +51,11 @@ export interface Eligibility {
   readonly invocations: readonly SudoInvocation[];
   /** Refusals that no approval can override. */
   readonly denied: { readonly command: string; readonly reason: string } | undefined;
-  /** Whether a stored rule may ever cover this line. */
+  /** Whether an existing rule may be matched against this line. */
+  readonly coverable: boolean;
+  /** Whether a new rule may be written from this line. */
   readonly grantable: boolean;
-  /** Why it may not be, when it may not be. */
+  /** Why no new rule may be written from it, when none may. */
   readonly notGrantableBecause: string | undefined;
   /** Separators and expansions found outside quotes. */
   readonly extras: readonly string[];
@@ -69,12 +71,28 @@ export interface Eligibility {
 }
 
 /**
- * The whole "may this be remembered?" decision, with no protocol around it.
+ * The whole "may this be remembered, and may it be recognised?" decision, with
+ * no protocol around it.
  *
- * A stored rule may only ever match a single plain command: one segment, no
- * pipes, no redirects, no expansions, and nothing on the ungrantable list. So
- * a grant for `systemctl restart *` can never be satisfied by
- * `sudo systemctl restart nginx; whoami` — that line is approved every time.
+ * Two different questions, deliberately kept apart:
+ *
+ * *Coverable* — may an existing rule be matched against this line? A rule is
+ * matched per sudo segment, exactly as sudo itself matches: a shell splits
+ * `sudo journalctl -u x | tail -30` before anything runs, so sudo's argv is
+ * `journalctl -u x` and `tail` is an unprivileged command that no rule governs.
+ * Refusing to match across a pipe was stricter than sudoers, and stricter than
+ * the thing being modelled without being safer than it: `tail` runs under
+ * `ssh_run` unprompted anyway, so a pipeline whose every sudo segment is covered
+ * confers nothing that was not already permitted one command at a time.
+ *
+ * What does have to hold is that the argv matched here is the argv that runs.
+ * Expansions and redirections break that — `sudo $(cat /tmp/x)` matches nothing
+ * honestly — so an unsettled line is never matched, whatever the rules say.
+ *
+ * *Grantable* — may a new rule be written from this line? Much narrower, and
+ * unchanged: one segment, one sudo, nothing on the ungrantable list. A rule is
+ * permanent and is read back by a human later; it is written only from a line
+ * that means one thing.
  */
 export function assess(command: string): Eligibility {
   const parsed = parseCommandLine(command);
@@ -88,6 +106,7 @@ export function assess(command: string): Eligibility {
       return {
         invocations,
         denied: { command: invocation.segment.text, reason: verdict.reason },
+        coverable: false,
         grantable: false,
         notGrantableBecause: verdict.reason,
         extras,
@@ -100,14 +119,18 @@ export function assess(command: string): Eligibility {
     .map((invocation) => classify(invocation))
     .find((verdict) => verdict.kind === 'ungrantable');
 
+  // An ungrantable command stops both: "never covered by a wildcard" is about
+  // what a rule may be matched against, not only about what may be written.
+  const blocked = ungrantable?.kind === 'ungrantable' ? ungrantable.reason : undefined;
+
   let notGrantableBecause: string | undefined;
   if (!parsed.simple) notGrantableBecause = `the line contains ${extras.join(' ')}`;
-  else if (ungrantable && ungrantable.kind === 'ungrantable') notGrantableBecause = ungrantable.reason;
-  else if (invocations.length > 1) notGrantableBecause = 'the line runs sudo more than once';
+  else if (blocked) notGrantableBecause = blocked;
 
   return {
     invocations,
     denied: undefined,
+    coverable: invocations.length > 0 && parsed.settled && blocked === undefined,
     grantable: invocations.length > 0 && notGrantableBecause === undefined,
     notGrantableBecause,
     extras,
@@ -240,7 +263,7 @@ export async function gatePrivileged(
   },
 ): Promise<SudoGate> {
   const eligibility = assess(options.command);
-  const { invocations, grantable } = eligibility;
+  const { invocations, coverable, grantable } = eligibility;
 
   if (invocations.length > 0) {
     const refusal = hardRefusal(options, eligibility);
@@ -257,10 +280,13 @@ export async function gatePrivileged(
     return { allowed: true, invocations };
   }
 
-  if (grantable) {
-    const grant = options.grants.find(options.alias, invocations[0]!.argv);
-    if (grant) {
-      options.record('allowed', `grant ${grant.host} ${formatPattern(grant.pattern)}`);
+  if (coverable) {
+    // Every sudo on the line, not just the first: a pipeline runs as many
+    // privileged commands as it names, and one uncovered segment is an
+    // uncovered line.
+    const covering = invocations.map((invocation) => options.grants.find(options.alias, invocation.argv));
+    if (covering.every((grant) => grant !== undefined)) {
+      options.record('allowed', covering.map((grant) => `grant ${grant.host} ${formatPattern(grant.pattern)}`).join('; '));
       return { allowed: true, invocations };
     }
   }

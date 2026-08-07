@@ -5,9 +5,15 @@
  * point of SSH. But a stored approval must never be matched against a line
  * whose meaning can change after the fact. So this splits the line the way a
  * shell would, and records every separator, expansion and redirection it saw
- * *outside* quotes. A line carrying any of those is "not simple", and a
- * not-simple line can never satisfy a wildcard grant — it can only be approved
- * once, with the extras shown to the user.
+ * *outside* quotes.
+ *
+ * The two are not equally dangerous, and are reported apart. A separator is
+ * resolved before anything runs and resolved the same way by every shell, so
+ * the segments either side of it are whole commands that can be judged one at a
+ * time — see `settled`. An expansion or a redirection is not: it decides at run
+ * time what the command actually is, so a line carrying one is "not settled"
+ * and can never satisfy a stored rule. `simple` is narrower still and governs
+ * only what may be written into the policy file as a new rule.
  */
 
 export interface Redirection {
@@ -41,8 +47,23 @@ export interface ParsedCommandLine {
   readonly separators: readonly string[];
   /** Unquoted expansions and redirections: `$(`, backtick, `${`, `$`, `<`, `>`. */
   readonly expansions: readonly string[];
-  /** One command, no separators, no expansions — the only shape a wildcard grant may match. */
+  /** One command, no separators, no expansions — the only shape a new rule may be written from. */
   readonly simple: boolean;
+  /**
+   * Every segment's argv is exactly what is written here, and will still be that
+   * when the remote shell runs it.
+   *
+   * The weaker sibling of `simple`, and the one that governs matching. A
+   * separator is not a hazard: a shell splits on `|` and `;` before anything
+   * runs, and splits identically wherever it runs, so each segment is a whole
+   * command that can be checked on its own — which is exactly what sudo itself
+   * sees. An expansion or a redirection is a hazard, because the argv this
+   * parser matched a rule against is then not the argv that executes.
+   *
+   * `&` is excluded with them, for the reason `sudo -b` is: output nobody sees
+   * is approval nobody can check.
+   */
+  readonly settled: boolean;
 }
 
 const SEPARATOR_CHARS = new Set([';', '&', '|', '\n']);
@@ -194,11 +215,14 @@ export function parseCommandLine(input: string): ParsedCommandLine {
 
   endSegment(input.length);
 
+  const settled = expansions.size === 0 && !separators.includes('&');
+
   return {
     segments,
     separators,
     expansions: [...expansions],
-    simple: segments.length === 1 && separators.length === 0 && expansions.size === 0,
+    simple: settled && segments.length === 1 && separators.length === 0,
+    settled,
   };
 }
 

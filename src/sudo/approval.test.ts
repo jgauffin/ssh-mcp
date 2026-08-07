@@ -65,7 +65,7 @@ describe('the rule that keeps wildcards honest', () => {
     'sudo systemctl restart $(cat /tmp/service)',
     'sudo systemctl restart `cat /tmp/service`',
     'sudo systemctl restart nginx > /tmp/out',
-  ])('%s can never be covered by a stored rule', (command) => {
+  ])('%s is never written into the policy file', (command) => {
     const result = assess(command);
     expect(result.denied).toBeUndefined();
     expect(result.grantable).toBe(false);
@@ -83,6 +83,47 @@ describe('the rule that keeps wildcards honest', () => {
 
   it('quoting a separator does not make a line non-simple', () => {
     expect(assess('sudo grep "a;b" /etc/hosts').grantable).toBe(true);
+  });
+});
+
+/**
+ * Matching a rule and writing one are different questions.
+ *
+ * A shell resolves `|` and `;` before anything runs, so `sudo journalctl -u x |
+ * tail -30` runs sudo over `journalctl -u x` and `tail` as nobody in
+ * particular — which is exactly what a rule in /etc/sudoers would be matched
+ * against. An expansion is the opposite: what runs is not known until it runs,
+ * so no rule can honestly be said to cover it.
+ */
+describe('which lines an existing rule may be matched against', () => {
+  it.each([
+    'sudo journalctl -u nginx | tail -30',
+    'sudo journalctl -u nginx; sudo journalctl -u caddy',
+    'sudo systemctl restart nginx && sudo systemctl status nginx',
+  ])('%s — a separator is resolved before anything runs', (command) => {
+    expect(assess(command).coverable).toBe(true);
+    // Still never *stored*: a rule is read back by a human, so it comes from a
+    // line that means one thing.
+    expect(assess(command).grantable).toBe(false);
+  });
+
+  it.each([
+    'sudo systemctl restart $(cat /tmp/service)',
+    'sudo systemctl restart `cat /tmp/service`',
+    'sudo systemctl restart nginx > /tmp/out',
+    'sudo journalctl -u nginx &',
+  ])('%s — what would run is not what a rule was matched against', (command) => {
+    expect(assess(command).coverable).toBe(false);
+  });
+
+  it('an ungrantable command stays uncovered however plainly it is written', () => {
+    // `find` can be talked into a shell, so no wildcard reaches it — matching is
+    // as much a way in as remembering.
+    expect(assess('sudo find / -name secret').coverable).toBe(false);
+  });
+
+  it('a denied command is never coverable', () => {
+    expect(assess('sudo -s').coverable).toBe(false);
   });
 });
 
@@ -175,5 +216,95 @@ describe('the gates', () => {
     const gate = await gatePrivileged({ ...options('sudo -s > /etc/foo'), approve: vi.fn() });
     expect(gate.allowed).toBe(false);
     expect(textOf(gate)).toContain('root shell');
+  });
+
+  /**
+   * The reason any of this changed: `journalctl **` was in the policy file and
+   * `sudo journalctl -u api | grep x` asked anyway, every time, because one pipe
+   * disqualified the whole line from being matched.
+   */
+  describe('a pipeline whose privileged half is already covered', () => {
+    const covering = (...patterns: string[][]): SudoGrants => {
+      const grants = new SudoGrants('/dev/null');
+      for (const pattern of patterns) grants.grantForSession('lab', pattern, 60_000);
+      return grants;
+    };
+
+    it('runs without asking again', async () => {
+      const approve = vi.fn();
+      const gate = await gatePrivileged({
+        ...options('sudo journalctl -u api --no-pager | grep -i fail | tail -5', {
+          grants: covering(['journalctl', '**']),
+        }),
+        approve,
+      });
+
+      expect(gate.allowed).toBe(true);
+      expect(approve).not.toHaveBeenCalled();
+    });
+
+    it('needs a rule for every sudo on the line, not just the first', async () => {
+      const approve = vi.fn(async () => 'once' as const);
+      const gate = await gatePrivileged({
+        ...options('sudo journalctl -u api | grep x; sudo systemctl restart api', {
+          grants: covering(['journalctl', '**']),
+        }),
+        approve,
+      });
+
+      // The second segment has no rule, so the line is still put to the user.
+      expect(gate.allowed).toBe(true);
+      expect(approve).toHaveBeenCalled();
+    });
+
+    it('runs silently once every sudo on it is covered', async () => {
+      const approve = vi.fn();
+      const gate = await gatePrivileged({
+        ...options('sudo journalctl -u api | grep x; sudo systemctl restart api', {
+          grants: covering(['journalctl', '**'], ['systemctl', 'restart', '*']),
+        }),
+        approve,
+      });
+
+      expect(gate.allowed).toBe(true);
+      expect(approve).not.toHaveBeenCalled();
+    });
+
+    it('records every rule it leaned on, so the audit log names them', async () => {
+      const record = vi.fn();
+      await gatePrivileged({
+        ...options('sudo journalctl -u api | grep x; sudo systemctl restart api', {
+          grants: covering(['journalctl', '**'], ['systemctl', 'restart', '*']),
+          record,
+        }),
+        approve: vi.fn(),
+      });
+
+      expect(record).toHaveBeenCalledWith('allowed', 'grant lab journalctl **; grant lab systemctl restart *');
+    });
+
+    it('still asks when the line can expand into something else', async () => {
+      const approve = vi.fn(async () => 'once' as const);
+      const gate = await gatePrivileged({
+        ...options('sudo journalctl -u $(cat /tmp/unit) | grep x', { grants: covering(['journalctl', '**']) }),
+        approve,
+      });
+
+      expect(gate.allowed).toBe(true);
+      expect(approve).toHaveBeenCalled();
+    });
+
+    it('does not let the unprivileged half write a file unseen', async () => {
+      const approve = vi.fn();
+      const gate = await gatePrivileged({
+        ...options('sudo journalctl -u api | tee /etc/journal.txt', { grants: covering(['journalctl', '**']) }),
+        approve,
+      });
+
+      // The write guard runs before the rules are ever consulted.
+      expect(gate.allowed).toBe(false);
+      expect(textOf(gate)).toContain('ssh_edit');
+      expect(approve).not.toHaveBeenCalled();
+    });
   });
 });

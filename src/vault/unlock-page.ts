@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { DEFAULT_PAGE_PORT } from '../config/config.js';
 
 /**
  * A single-use page on 127.0.0.1 for asking the user something directly.
@@ -17,6 +18,13 @@ import type { AddressInfo } from 'node:net';
  * as you can already read your key files. What it does buy, completely, is that
  * the passphrase never enters the MCP protocol, the transcript, or the model's
  * context.
+ *
+ * Every page in a process shares one listener on one port. Not for efficiency —
+ * for the browser. Chrome's "never save this password" list is keyed on origin,
+ * and an origin includes the port, so a fresh port per page meant being asked to
+ * save the passphrase forever, once per page. One stable port makes that a
+ * single click. The pages stay single-use regardless: each is reachable only at
+ * its own nonce path, and that path stops existing the moment it is done with.
  */
 
 export interface SecretField {
@@ -230,6 +238,107 @@ async function readBody(req: IncomingMessage): Promise<string | undefined> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** Serves one live page. Registered under its nonce path for as long as it lives. */
+type Route = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+
+const routes = new Map<string, Route>();
+/** How far to walk up from the configured port before giving up on a stable one. */
+const PORT_LADDER = 10;
+
+let configuredPort = DEFAULT_PAGE_PORT;
+let listener: Promise<number> | undefined;
+
+/**
+ * Sets the port pages are served on. Call once, at startup, before any page is
+ * opened — after that the listener is bound and this does nothing.
+ *
+ * `0` opts back into a random port per run, at the cost of the browser treating
+ * every run as a new site.
+ */
+export function setPagePort(port: number): void {
+  configuredPort = port;
+}
+
+/** Resolves once a port is bound; every later page reuses it. */
+function listen(): Promise<number> {
+  listener ??= bind();
+  return listener;
+}
+
+async function bind(): Promise<number> {
+  const server = createServer(dispatch);
+  // A page is something the user may or may not get round to. It must never be
+  // the reason the process stays alive.
+  server.unref();
+
+  // Walking up from the configured port keeps a second ssh-mcp on the same
+  // machine off this one's port, rather than failing to start over it. It also
+  // keeps that second instance stable at its own port for its whole life.
+  // The last resort is 0 — a working page on an awkward port beats no page.
+  const candidates =
+    configuredPort === 0 ? [0] : [...Array.from({ length: PORT_LADDER }, (_, step) => configuredPort + step), 0];
+
+  for (const candidate of candidates) {
+    const port = await tryListen(server, candidate);
+    if (port !== undefined) return port;
+  }
+  throw new Error('could not bind a loopback port for the unlock page');
+}
+
+/** Resolves the bound port, or `undefined` if this port is unavailable. */
+function tryListen(server: Server, port: number): Promise<number | undefined> {
+  return new Promise((resolve, reject) => {
+    const onError = (error: NodeJS.ErrnoException): void => {
+      server.removeListener('listening', onListening);
+      // Only a busy port is worth stepping over; anything else is a real fault
+      // and should be seen rather than papered over with a random port.
+      if (error.code === 'EADDRINUSE' || error.code === 'EACCES') resolve(undefined);
+      else reject(error);
+    };
+    const onListening = (): void => {
+      server.removeListener('error', onError);
+      resolve((server.address() as AddressInfo).port);
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, '127.0.0.1');
+  });
+}
+
+/**
+ * Finds the page a request is for.
+ *
+ * Compared one path at a time rather than looked up in the map: the nonce is the
+ * only thing standing between a local process and the ability to submit an
+ * answer, so it is matched in constant time. There are never more than a handful
+ * of live pages.
+ */
+function routeFor(path: string): Route | undefined {
+  for (const [registered, route] of routes) {
+    if (safeEqual(registered, path)) return route;
+  }
+  return undefined;
+}
+
+async function dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  // Bound to loopback already; this is belt and braces.
+  const remote = req.socket.remoteAddress ?? '';
+  if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
+    res.writeHead(403).end();
+    return;
+  }
+
+  const route = routeFor((req.url ?? '').split('?')[0] ?? '');
+  if (!route) {
+    // A wrong, expired or replayed nonce reveals nothing. Now that the listener
+    // outlives each page, this is also what a finished page answers with.
+    res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
+    return;
+  }
+
+  await route(req, res);
+}
+
 /** Starts the page and returns as soon as it is listening. */
 export async function openUnlockPage(options: UnlockPageOptions): Promise<UnlockPage> {
   const nonce = randomBytes(32).toString('base64url');
@@ -240,35 +349,21 @@ export async function openUnlockPage(options: UnlockPageOptions): Promise<Unlock
     settle = resolve;
   });
 
-  let server: Server;
   let closed = false;
   const shutdown = (wasAccepted: boolean): void => {
     if (closed) return;
     closed = true;
     clearTimeout(timer);
+    // Unregistering is what closes the page: the path stops resolving, so a
+    // reload or a late POST lands on the same 404 as a forged nonce.
+    routes.delete(path);
     settle(wasAccepted);
-    server.closeAllConnections();
-    server.close();
   };
 
   const timer = setTimeout(() => shutdown(false), options.timeoutMs);
   timer.unref();
 
-  server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    // Bound to loopback already; this is belt and braces.
-    const remote = req.socket.remoteAddress ?? '';
-    if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
-      res.writeHead(403).end();
-      return;
-    }
-
-    const url = req.url ?? '';
-    if (!safeEqual(url.split('?')[0] ?? '', path)) {
-      // A wrong or replayed nonce reveals nothing and does not consume the page.
-      res.writeHead(404, { 'content-type': 'text/plain' }).end('not found');
-      return;
-    }
-
+  routes.set(path, async (req: IncomingMessage, res: ServerResponse) => {
     if (req.method === 'GET') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       res.end(formPage(options, path));
@@ -327,13 +422,15 @@ export async function openUnlockPage(options: UnlockPageOptions): Promise<Unlock
     res.end(DONE_PAGE, () => shutdown(true));
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  server.unref();
+  let port: number;
+  try {
+    port = await listen();
+  } catch (cause) {
+    // No listener means no page. Leaving the route registered would strand it.
+    shutdown(false);
+    throw cause;
+  }
 
-  const port = (server.address() as AddressInfo).port;
   return {
     url: `http://127.0.0.1:${port}${path}`,
     accepted,

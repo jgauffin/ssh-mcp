@@ -78,8 +78,11 @@ export class SudoGrants {
   }
 
   /**
-   * Finds a rule covering this command. Callers must only reach here for a
-   * simple, single-segment command — see `parseCommandLine().simple`.
+   * Finds a rule covering one sudo invocation's argv.
+   *
+   * One invocation, not one line: a line may run sudo more than once, and each
+   * of those has to find its own rule. Callers must only reach here for a
+   * settled line — see `parseCommandLine().settled`.
    */
   find(alias: string, argv: readonly string[]): Grant | undefined {
     const now = Date.now();
