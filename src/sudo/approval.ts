@@ -2,7 +2,13 @@ import type { CallToolResult } from '@modelcontextprotocol/server';
 import { classify } from './denylist.js';
 import type { SudoGrants } from './grants.js';
 import { formatPattern, proposePatterns } from './matcher.js';
-import { parseCommandLine, sudoInvocations, type SudoInvocation } from './parse.js';
+import {
+  parseCommandLine,
+  sudoInvocations,
+  type CommandSegment,
+  type ParsedCommandLine,
+  type SudoInvocation,
+} from './parse.js';
 import { detectFileWrite, type FileWrite } from './writes.js';
 
 /**
@@ -57,8 +63,14 @@ export interface Eligibility {
   readonly grantable: boolean;
   /** Why no new rule may be written from it, when none may. */
   readonly notGrantableBecause: string | undefined;
-  /** Separators and expansions found outside quotes. */
-  readonly extras: readonly string[];
+  /**
+   * Every command the line would run, in order.
+   *
+   * What the approval page shows. Listing the punctuation between them told the
+   * reader nothing they could act on — a wall of `; ; ; &&` is not a decision.
+   * The commands are the decision.
+   */
+  readonly segments: readonly CommandSegment[];
   /**
    * A write that would change a file nobody has seen a diff of.
    *
@@ -94,10 +106,29 @@ export interface Eligibility {
  * permanent and is read back by a human later; it is written only from a line
  * that means one thing.
  */
+/**
+ * Why a line is more than one plain command, said in words.
+ *
+ * Deliberately not a list of the operators found. "the line contains && && && ;
+ * ; ; ; ; ; ; ; ; ; >" is punctuation the reader has to parse back into meaning;
+ * "it runs 14 commands, not one" is the meaning.
+ */
+function shapeOf(parsed: ParsedCommandLine): string {
+  const parts: string[] = [];
+
+  if (parsed.segments.length > 1) parts.push(`it runs ${parsed.segments.length} commands, not one`);
+  else if (parsed.separators.length > 0) parts.push('it carries a shell separator of its own');
+
+  if (parsed.expansions.some((extra) => extra === '>' || extra === '<')) parts.push('it redirects');
+  if (parsed.expansions.some((extra) => extra !== '>' && extra !== '<'))
+    parts.push('the shell rewrites part of it at run time');
+
+  return parts.join('; ');
+}
+
 export function assess(command: string): Eligibility {
   const parsed = parseCommandLine(command);
   const invocations = sudoInvocations(parsed);
-  const extras = [...parsed.separators, ...parsed.expansions];
   const fileWrite = detectFileWrite(parsed);
 
   for (const invocation of invocations) {
@@ -109,7 +140,7 @@ export function assess(command: string): Eligibility {
         coverable: false,
         grantable: false,
         notGrantableBecause: verdict.reason,
-        extras,
+        segments: parsed.segments,
         fileWrite,
       };
     }
@@ -124,7 +155,7 @@ export function assess(command: string): Eligibility {
   const blocked = ungrantable?.kind === 'ungrantable' ? ungrantable.reason : undefined;
 
   let notGrantableBecause: string | undefined;
-  if (!parsed.simple) notGrantableBecause = `the line contains ${extras.join(' ')}`;
+  if (!parsed.simple) notGrantableBecause = shapeOf(parsed);
   else if (blocked) notGrantableBecause = blocked;
 
   return {
@@ -133,7 +164,7 @@ export function assess(command: string): Eligibility {
     coverable: invocations.length > 0 && parsed.settled && blocked === undefined,
     grantable: invocations.length > 0 && notGrantableBecause === undefined,
     notGrantableBecause,
-    extras,
+    segments: parsed.segments,
     fileWrite,
   };
 }

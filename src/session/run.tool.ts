@@ -210,6 +210,13 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
           guardFileWrites: host.fileWrites !== 'off',
           record: (outcome, detail) => runtime.audit.write({ event: 'sudo', outcome, host: alias, command: cmd, detail }),
           approve: async (eligibility) => {
+            // What a person actually decides on: which commands run as root, and
+            // how much else is riding along on the same line. The segments that
+            // use sudo are named one by one; the rest are counted, because a
+            // reader who wants them verbatim has the whole line above.
+            const privileged = new Set(eligibility.invocations.map((invocation) => invocation.segment));
+            const rest = eligibility.segments.filter((segment) => !privileged.has(segment)).length;
+
             const outcome = await askForApproval({
               // Keyed by host and command, so two different commands cannot
               // share a page and have one answer stand for both.
@@ -218,7 +225,10 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
               subject: cmd,
               detail: [
                 `host: ${alias} (${host.user}@${host.host})`,
-                eligibility.extras.length > 0 ? `shell extras: ${eligibility.extras.join(' ')}` : 'shell extras: none',
+                ...eligibility.invocations.map((invocation) => `as root: ${invocation.segment.text}`),
+                ...(rest > 0
+                  ? [`also: ${rest} other command${rest === 1 ? '' : 's'} on the same line, as ${host.user}`]
+                  : []),
                 ...(eligibility.notGrantableBecause ? [`cannot be remembered: ${eligibility.notGrantableBecause}`] : []),
               ],
               choices: [

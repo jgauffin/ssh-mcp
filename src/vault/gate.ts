@@ -95,17 +95,24 @@ function urlElicitationUnavailable(ctx: ServerContext, capabilities: Capabilitie
     return 'this client did not declare support for elicitation';
   }
 
-  // A 2025-era client declares a bare `elicitation: {}` with no sub-modes; the
-  // SDK handles that path. Only single out a client that explicitly offers form
-  // mode and not URL mode.
-  if (elicitation.form !== undefined && elicitation.url === undefined) {
+  // Named URL mode is the only thing that counts as URL mode. Anything else is
+  // a protocol error the moment the round is returned: the SDK refuses to send
+  // a request the client never said it could receive.
+  if (elicitation.url !== undefined) {
+    return undefined;
+  }
+
+  if (elicitation.form !== undefined) {
     return (
       `this client supports form-mode elicitation but not URL mode, and ${secret} will not be collected ` +
       "through a form — form answers travel back through the client and into the model's context"
     );
   }
 
-  return undefined;
+  // `elicitation: {}` — the capability, with neither sub-mode named. What
+  // Claude Code declares, and what made the first command after a restart fail
+  // with a capability error instead of asking for the passphrase.
+  return 'this client declared elicitation but named no sub-mode, so it cannot be shown a URL prompt';
 }
 
 /**

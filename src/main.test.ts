@@ -390,6 +390,33 @@ describe('on a 2025-era connection, which is what Claude Code opens', () => {
   });
 });
 
+/**
+ * Seen in the wild, on the first command after a client restart:
+ * `Cannot request input 'unlock' (elicitation/create): the request's client
+ * capabilities do not declare the required capability`.
+ *
+ * The client declares `elicitation: {}` — the capability, with neither sub-mode
+ * named. That is not a URL-capable client, and asking it for a URL prompt is a
+ * protocol error rather than a question anyone gets to answer.
+ */
+describe('on a client that declares elicitation without naming a sub-mode', () => {
+  for (const era of ['modern', 'legacy'] as const) {
+    it(`relays the unlock link rather than a capability error (${era} connection)`, async () => {
+      const bare = await start(CONFIG, {}, era);
+      try {
+        const locked = textOf(await bare.callTool({ name: 'ssh_run', arguments: { host: 'lab', cmd: 'true' } }));
+
+        expect(locked).not.toContain('did not declare the required capability');
+        expect(locked).not.toContain('elicitation/create');
+        expect(locked).toContain('ssh-mcp is locked');
+        expect(locked).toMatch(/http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/);
+      } finally {
+        await bare.close();
+      }
+    });
+  }
+});
+
 describe('seeing what actually ran', () => {
   beforeEach(async () => {
     pageBodies = [];
@@ -666,16 +693,24 @@ describe('the sudo gate refuses before it connects', () => {
     expect(page).not.toContain('type="password"');
   });
 
-  it('shows the shell extras that stop a command being remembered', async () => {
+  it('names the commands on the line, and says in words why it cannot be remembered', async () => {
     const result = textOf(
-      await client.callTool({ name: 'ssh_sudo', arguments: { host: 'lab', cmd: 'sudo apt update; whoami' } }),
+      await client.callTool({
+        name: 'ssh_sudo',
+        arguments: { host: 'lab', cmd: 'sudo apt update; whoami; sudo systemctl restart nginx' },
+      }),
     );
     const url = /http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/.exec(result)![0];
 
     const page = await (await fetch(url)).text();
-    expect(page).toContain('sudo apt update; whoami');
-    expect(page).toContain('shell extras: ;');
-    expect(page).toContain('cannot be remembered');
+    expect(page).toContain('sudo apt update; whoami; sudo systemctl restart nginx');
+    // Every privileged segment by name, and the rest counted rather than dumped.
+    expect(page).toContain('as root: sudo apt update');
+    expect(page).toContain('as root: sudo systemctl restart nginx');
+    expect(page).toContain('also: 1 other command on the same line, as root');
+    // Prose, not a pile of separators.
+    expect(page).toContain('cannot be remembered: it runs 3 commands, not one');
+    expect(page).not.toContain('shell extras');
     // With nothing safe to store, "for this session" is not offered at all.
     expect(page).not.toContain('value="session"');
   });

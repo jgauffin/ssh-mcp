@@ -167,7 +167,7 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
   h1 { margin:0 0 .25rem; font-size:1.15rem; }
   p.sub { margin:0 0 1.25rem; color:var(--muted); font-size:.9rem; }
   ul { margin:0 0 1.25rem; padding-left:1.1rem; color:var(--muted); font-size:.875rem; }
-  li { margin:.15rem 0; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; }
+  li { margin:.15rem 0; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap:anywhere; }
   label { display:block; margin:.75rem 0 .3rem; font-size:.85rem; font-weight:600; }
   input { width:100%; padding:.6rem .7rem; font-size:1rem; border:1px solid var(--line); border-radius:6px;
           background:var(--bg); color:var(--fg); }
@@ -178,7 +178,7 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
             background:color-mix(in srgb, #c0392b 15%, transparent); border:1px solid #c0392b; }
   pre.subject { margin:0 0 1.25rem; padding:.75rem .85rem; border:1px solid var(--line); border-radius:6px;
                 background:var(--bg); font:13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
-                white-space:pre-wrap; word-break:break-all; }
+                white-space:pre-wrap; overflow-wrap:anywhere; max-height:22rem; overflow:auto; }
   fieldset { margin:0; padding:0; border:0; }
   legend { padding:0; margin:0 0 .5rem; font-size:.85rem; font-weight:600; }
   label.opt { display:flex; gap:.6rem; align-items:flex-start; margin:0; padding:.5rem .6rem; font-weight:400;
