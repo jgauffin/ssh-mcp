@@ -283,6 +283,51 @@ export async function askForApproval(options: {
   return { kind: 'pending', url: page.url, opened };
 }
 
+export type SecretValueOutcome =
+  | { readonly kind: 'collected' }
+  | { readonly kind: 'pending'; readonly url: string; readonly opened: boolean };
+
+/**
+ * Asks the user to type one or more values the model must never hold.
+ *
+ * The passphrase page, pointed at a different destination: `onSubmit` puts what
+ * was typed straight into the secret store, so the value exists on this side of
+ * the boundary and the model only ever learns the marker for it. Used by
+ * `ssh_edit` for `{{ssh-mcp:ask:…}}`, which is how a new password gets into a
+ * file without being authored in the transcript.
+ *
+ * Several names in one page on purpose: rotating a credential usually means a
+ * user and a password, and two pages for one decision is two chances to answer
+ * half of it.
+ */
+export async function askForSecretValues(options: {
+  readonly key: string;
+  readonly title: string;
+  readonly subject: string;
+  readonly detail: readonly string[];
+  readonly names: readonly string[];
+  readonly onSubmit: (values: Map<string, string>) => void;
+  readonly openBrowser: boolean;
+}): Promise<SecretValueOutcome> {
+  const { accepted, url, opened } = await collectNow(
+    options.key,
+    {
+      title: options.title,
+      detail: [...options.detail],
+      subject: options.subject,
+      fields: options.names.map((name) => ({ name, label: name })),
+      submitLabel: 'Use these values',
+    },
+    async (values) => {
+      options.onSubmit(values);
+      return undefined;
+    },
+    options.openBrowser,
+  );
+
+  return accepted ? { kind: 'collected' } : { kind: 'pending', url, opened };
+}
+
 /** Wording shared by every relayed-link message, so they read the same way. */
 function relayed(what: string, url: string, opened: boolean): string {
   return (

@@ -45,6 +45,14 @@ export interface SudoGateOptions {
   readonly policyPath: string;
   /** False when this host has file-write guarding switched off in ssh-mcp.toml. */
   readonly guardFileWrites: boolean;
+  /**
+   * The line carried a withheld secret that has been expanded into it.
+   *
+   * Forces the page and forbids remembering, for the same reason `$(…)` does:
+   * what runs is not what the model wrote. Here the difference is a value the
+   * model never held, which only a person reading the expanded line can judge.
+   */
+  readonly carriesSecret?: boolean;
   /** Called when a decision is made, for the audit log. */
   readonly record: (outcome: string, detail: string) => void;
 }
@@ -294,7 +302,11 @@ export async function gatePrivileged(
   },
 ): Promise<SudoGate> {
   const eligibility = assess(options.command);
-  const { invocations, coverable, grantable } = eligibility;
+  const { invocations, coverable } = eligibility;
+  // A line holding a secret is never grantable, whatever its shape: a stored
+  // rule is matched against a command, and the command that ran contained a
+  // value nobody would recognise in the policy file.
+  const grantable = eligibility.grantable && options.carriesSecret !== true;
 
   if (invocations.length > 0) {
     const refusal = hardRefusal(options, eligibility);
@@ -306,12 +318,14 @@ export async function gatePrivileged(
   const write = writeRefusalFor('ssh_sudo', options, eligibility);
   if (write) return { allowed: false, result: write };
 
-  if (invocations.length === 0) {
+  // The no-sudo shortcut is exactly where a secret would otherwise reach the
+  // shell with nobody asked: `ssh_sudo "psql -c '…'"` needs no sudo at all.
+  if (invocations.length === 0 && options.carriesSecret !== true) {
     options.record('allowed', 'no sudo in the command');
     return { allowed: true, invocations };
   }
 
-  if (coverable) {
+  if (coverable && options.carriesSecret !== true) {
     // Every sudo on the line, not just the first: a pipeline runs as many
     // privileged commands as it names, and one uncovered segment is an
     // uncovered line.

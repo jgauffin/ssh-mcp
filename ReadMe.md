@@ -49,6 +49,7 @@ is a deliberate departure from that shape.
 | **Approval scope** | Per tool call, or none | Per (host, argv); a session grant dies when the vault relocks, and only you can make one permanent |
 | **Command analysis** | Substring or regex over the command string | Shell-aware: the line is split into segments, and a stored rule can only ever match a single plain command |
 | **Output** | JSON envelope | Plain text, as a terminal would show it |
+| **File secrets** | Returned in full, so editing a config puts its passwords in the transcript | Withheld as markers the model can anchor on but not read, put back server-side for the write. A new password can be generated or typed rather than authored by the model |
 | **Audit** | — | Append-only JSONL of every command, decision and grant |
 
 ### The model cannot name a machine you did not
@@ -129,6 +130,15 @@ Scope, stated plainly:
   A deliberate trade: a single-use nonce for a loopback listener with a
   two-minute life, granting only the ability to *submit* a passphrase the holder
   does not know. The passphrase never goes near that context on either path.
+- **Withholding secrets is hygiene, not containment.** It removes what the
+  ordinary read-then-edit workflow forces into your transcript. It does nothing
+  against `base64`, `xxd` or `rev`, and the marker itself says where to aim. The
+  control that actually holds is the connecting user's own permissions; see
+  [Where this stops](#where-this-stops).
+- **A marker can be moved.** The model can put a value it never saw somewhere
+  else in the file, or into another file on the same host, or into an `ssh_sudo`
+  command line. Every one of those is a page you answer with the real value in
+  front of you, and none of them can be remembered.
 - **`ssh_ls` and `ssh_get` run as the connecting user**, no sudo path at all.
   `ssh_edit` does escalate; the page you answer says so and shows the diff
   first.
@@ -153,6 +163,13 @@ Scope, stated plainly:
 - **A file `ssh_edit` creates is made as you if the directory allows it.**
   Otherwise it lands as `root:root` mode 0644, there being no basis for guessing
   an owner. The reply says which happened.
+- **Two edits to one file are queued, a third party is not.** The file is read
+  once more immediately before the write and the write is abandoned if it moved
+  since you saw the diff, so the loser of a race is told rather than silently
+  overwritten. That check is only authoritative for this process, which is why
+  writes to the same file are serialised here. Someone typing into the same
+  config over their own SSH session in the same second can still lose an update:
+  closing that needs a compare-and-swap neither SFTP nor `cp` offers.
 - **`ssh_edit` takes no backup.** A `.bak` beside a config file is a hazard:
   `nginx`, `logrotate.d`, `sudoers.d`, `sysctl.d`, `cron.d` and
   `sources.list.d` all glob their directories, and it copies whatever secret the
@@ -173,8 +190,23 @@ git clone <this repo> ssh-mcp
 cd ssh-mcp
 npm install
 npm run build
-npm test          # 330 tests, no network or server needed
+npm test          # no network or server needed
 ```
+
+With Docker running, there is a second suite that does the same work against a
+real host:
+
+```sh
+npm run test:integration
+```
+
+It builds `docker/Dockerfile` — Debian, sshd, sudo, and a few config files with
+passwords in them — starts a container, and drives the built server through a
+real MCP client, answering the loopback pages over HTTP the way you would in a
+browser. Then it reads the files back with `docker exec` and asserts on what the
+*host* holds: that a password survived an edit byte for byte, that a root-owned
+file kept its owner and mode, and that no secret from the container appears
+anywhere in what the model was told. It skips itself when Docker is not running.
 
 Register it with Claude Code:
 
@@ -230,6 +262,11 @@ confirm-every-command = false
 # if something else on this machine wants 8765; see below for why it is fixed.
 page-port = 8765
 
+[secrets]
+# Withhold passwords and keys from ssh_get and command output, so editing a
+# config file does not copy its credentials into the transcript. On by default.
+redact = true
+
 # Import connection details from an entry you already have.
 [hosts.prod-1]
 from = "ssh-config:prod-1"    # HostName / User / Port / IdentityFile from ~/.ssh/config
@@ -261,6 +298,17 @@ defeat the point.
 | `sudo` | `"ask"` (default) runs sudo through the gate; `"off"` refuses it outright |
 | `file-writes` | `"guard"` (default) makes `ssh_run` and `ssh_sudo` refuse in-place edits and point at `ssh_edit`; `"off"` lets them through. There is no tool parameter for this and the refusals never mention it: it is a lever you pull, not one the model can ask for. A host with it off says `writes:unguarded` in the listing |
 | `description` | Shown in the host listing instead of the source |
+
+### Secret keys
+
+| Key | Meaning |
+| --- | --- |
+| `redact` | `true` (default) withholds secret-looking values from `ssh_get` and command output, and puts them back for an `ssh_edit` write. `false` returns everything verbatim |
+| `patterns` | Extra patterns, on top of the built-in set. Group 1 is the value to withhold; a leading `(?i)` makes the pattern case-insensitive. One that will not compile, or has no capture group, is reported on stderr and dropped on its own |
+| `paths` | Files whose contents are never returned at all, not even redacted. `*` stops at a `/`, `**` crosses one, and a pattern with no `/` matches the file name wherever it lives |
+
+See [Editing a file that has a password in it](#editing-a-file-that-has-a-password-in-it)
+for what the model sees, and for what this does not protect you from.
 
 Authentication is **keys only**. No password option, deliberately: a password
 must live somewhere, and every somewhere is worse than an encrypted key file.
@@ -448,17 +496,121 @@ this diff was ever approved.
 with a pointer back here. The sudo approval page can show you a command line and
 nothing about what the file would end up containing.
 
+### Editing a file that has a password in it
+
+The file you most want the assistant to edit is the one you least want it to
+read. An anchored edit needs an anchor, so "read it, then change the line above
+the password" put the password in the transcript, in your client's session log
+and in the model provider's request. Every time.
+
+So the value is withheld and the position is not:
+
+```
+you:    add a connection pool setting to /etc/app/appsettings.json on prod-1
+claude: [ssh_get prod-1 /etc/app/appsettings.json]
+
+        "ConnectionStrings": {
+          "Db": "Host=db;Username=app;Password={{ssh-mcp:secret:7a2fb1c4}}"
+        },
+        "Pool": { "Max": 20 }
+
+        — 1 value(s) in this file are withheld and shown as {{ssh-mcp:secret:…}}
+          markers. They are still in the file.
+```
+
+The model anchors on the marker like any other text, `ssh_edit` puts the real
+value back before it matches, and the diff on your approval page shows the
+password in full, because a diff you cannot read is not a decision. The reply is
+line counts, as it always was.
+
+Withheld by default: `password`, `passwd`, `pwd`, `secret`, `token`, `api_key`,
+`access_key`, `client_secret`, `credentials`, `auth_token` and `private_key`
+assignments in any of the usual shapes, the password half of a `scheme://user:pw@host`
+URL, and any `-----BEGIN … PRIVATE KEY-----` block. A key whose value is `true`,
+a number, or `$SOMETHING` is left alone: there is no secret on that line, and
+hiding it costs the model what it needs to be useful.
+
+Markers are per host, live in memory, and die when the vault relocks. They are
+HMACs under a per-process key, so a marker in an old transcript is not a digest
+anyone can attack, and after a relock it names nothing at all.
+
+#### Setting a password nobody has to see
+
+Rotation runs the other way: `new_string` is authored by the model, so a new
+password would be in the transcript by construction. Two markers avoid that:
+
+| In `new_string` | What happens |
+| --- | --- |
+| `{{ssh-mcp:generate:32}}` | ssh-mcp invents the value, from an alphabet with no shell or quoting metacharacters in it. Repeat the same request in one call and you get one value, so a password and the connection string beside it match |
+| `{{ssh-mcp:ask:db-password}}` | A loopback page asks *you* to type it, exactly as the key passphrase is asked for. The name is remembered until relock |
+
+Either way the approval diff shows what the file will really contain, and the
+reply hands back a marker for the value so the rest of the session can refer to
+it. That is what makes the second half of a rotation possible:
+
+```
+claude: [ssh_edit  prod-1 /etc/app/appsettings.json  → {{ssh-mcp:generate:32}}]
+        Applied 1 edit(s) … The value(s) written are held as
+        {{ssh-mcp:secret:c81d0f22}} until the vault relocks.
+
+claude: [ssh_sudo prod-1 "sudo -u postgres psql -c \"ALTER USER app PASSWORD
+                          '{{ssh-mcp:secret:c81d0f22}}'\""]
+```
+
+`ssh_sudo` expands markers; `ssh_run` refuses them outright, because it is the
+tool with no page in front of it and an expanded marker there would be a
+password retrieved with `echo`. A line carrying a marker **always** opens the
+approval page, even one with no `sudo` in it, and can never be remembered for
+the session or written into your policy file. The page shows the expanded line,
+which is also the line that gets parsed, denylisted and write-checked: analysing
+the marker form and running the expanded one is the `sudo $(…)` mistake.
+
+`audit.jsonl` and the echo in the transcript keep the marker form. The value
+went from your browser, or the server's random generator, to the file.
+
+#### Where this stops
+
+Once a value is known for a host it is masked wherever it turns up, not only
+where a pattern finds it, so `echo … > /tmp/x` and then `cat /tmp/x` gives back
+the marker. But redaction is hygiene, not containment. It removes the exposure
+the ordinary read-then-edit workflow *forces* on you, and a model that means to
+have the value still has a shell: `base64`, `xxd`, `rev`, `cut -c20-`,
+`openssl enc`. None of those produce anything a pattern or a string comparison
+will recognise. The marker is also a map: it says exactly which line to aim at.
+
+What contains that case is the operating system, and it is already how this
+server is built. `ssh_get` and `ssh_run` run as the connecting user with **no
+sudo path at all**, so a root-owned `0600` file is beyond both of them today.
+Only `ssh_edit` can read it, through `sudo base64`, and that content has never
+reached the model. If a secret genuinely must not be readable by an assistant,
+the answer is the file's mode, not a regex.
+
+The pattern set is not exhaustive either. `[secrets].patterns` adds your own,
+group 1 being the value, and `[secrets].paths` withholds whole files:
+
+```toml
+[secrets]
+redact = true                                    # default
+patterns = ['(?i)^\s*ldap_bind_pw\s*=\s*(.+)$']
+paths = ["/etc/app/*.env", "id_rsa"]             # contents never returned at all
+```
+
+A path listed there is refused by `ssh_get` outright rather than redacted: for a
+file that is nothing but secret, the honest answer is that the model does not
+read it. `ssh_status` says whether redaction is on, which is how you confirm the
+config took.
+
 ### Tools
 
 | Tool | What it does |
 | --- | --- |
-| `ssh_run` | Runs a command line. Pipelines work; writing a file does not. Output comes back as plain text, capped at 300 lines / 64 KiB with the middle elided. **Never runs sudo** |
-| `ssh_sudo` | Runs a privileged command, after showing you the exact command on a page and waiting for your answer. **Never writes a file** |
+| `ssh_run` | Runs a command line. Pipelines work; writing a file does not. Output comes back as plain text, capped at 300 lines / 64 KiB with the middle elided, with secrets withheld. **Never runs sudo, never expands a marker** |
+| `ssh_sudo` | Runs a privileged command, after showing you the exact command on a page and waiting for your answer. Expands markers, and a line carrying one is always shown and never remembered. **Never writes a file** |
 | `ssh_ls` | Lists a directory over SFTP, in `ls -l` form |
-| `ssh_get` | Reads a text file over SFTP (≤ 256 KiB; binary refused) |
-| `ssh_edit` | Replaces exact snippets of a remote file. Shows you the unified diff on a page and waits for your answer before writing anything, including files owned by root, which it writes through sudo |
+| `ssh_get` | Reads a text file over SFTP (≤ 256 KiB; binary refused), with passwords and keys replaced by markers |
+| `ssh_edit` | Replaces exact snippets of a remote file. Shows you the unified diff on a page and waits for your answer before writing anything, including files owned by root, which it writes through sudo. Puts withheld values back, and can generate or ask for a new one |
 | `ssh_hosts` | Lists the aliases you configured. Also published as the `ssh://hosts` resource |
-| `ssh_status` | Locked or unlocked, which sudo grants are live, where the policy and audit files are |
+| `ssh_status` | Locked or unlocked, which sudo grants are live, whether secrets are withheld, where the policy and audit files are |
 | `ssh_lock` | Locks immediately: forgets the keys, closes the connections, revokes session grants |
 
 Every `ssh_run` result opens with the command as a shell prompt line, so the
@@ -508,6 +660,9 @@ src/
   hosts/        WHO we may talk to    — registry, ~/.ssh/config, PuTTY registry
   vault/        WHETHER we may act    — lock state, unlock page, MRTR gate, key decoding
   sudo/         WHAT we may do        — parser, matcher, denylist, write guard, grants, the two gates
+  secrets/      WHAT may be said      — secret patterns, the withheld-value store
   session/      HOW we talk           — connection pool, exec, SFTP, anchored edits, diff
   audit/        what happened
+  integration/  the same, against a container (npm run test:integration)
+docker/         the throwaway host those tests build
 ```

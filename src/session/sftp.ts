@@ -23,10 +23,52 @@ export const SFTP_PERMISSION_DENIED = 3;
 /** Servers that do not distinguish return this for a refusal too. */
 export const SFTP_FAILURE = 4;
 
-export function sftp(client: Client): Promise<SFTPWrapper> {
+/**
+ * One SFTP channel per connection, opened on demand and reused.
+ *
+ * Not an optimisation. `client.sftp()` opens a *new* channel every call and
+ * nothing here ever closed one, so every `ssh_get`, `ssh_ls` and `ssh_edit`
+ * left a session open on the far end. OpenSSH allows ten per connection by
+ * default, so the eleventh file operation of a conversation — and every
+ * command after it, because `exec` needs a session too — failed with
+ * `Channel open failure: open failed`, and stayed broken until the vault
+ * relocked and took the connection with it.
+ *
+ * Sharing one channel is safe: SFTP multiplexes requests over it by id, which
+ * is what makes concurrent reads on a single channel ordinary rather than
+ * clever.
+ */
+const channels = new WeakMap<Client, Promise<SFTPWrapper>>();
+
+function openChannel(client: Client): Promise<SFTPWrapper> {
   return new Promise((resolve, reject) => {
     client.sftp((error, wrapper) => (error ? reject(error) : resolve(wrapper)));
   });
+}
+
+export function sftp(client: Client): Promise<SFTPWrapper> {
+  const open = channels.get(client);
+  if (open) return open;
+
+  const opening = openChannel(client);
+  channels.set(client, opening);
+
+  const forget = (): void => {
+    if (channels.get(client) === opening) channels.delete(client);
+  };
+
+  opening.then((wrapper) => {
+    // A channel-level fault, as opposed to a failed request: every operation
+    // in flight still fails through its own callback with its own message.
+    // All this does is stop a dead channel being handed out again — and
+    // listening at all is what keeps ssh2 from throwing the event at the
+    // process instead.
+    wrapper.once('close', forget);
+    wrapper.once('end', forget);
+    wrapper.once('error', forget);
+  }, forget);
+
+  return opening;
 }
 
 export function sftpErrorCode(error: unknown): number | undefined {

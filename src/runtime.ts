@@ -4,6 +4,8 @@ import { createRequestStateCodec, type RequestStateCodec, type ServerContext } f
 import { AuditLog } from './audit/audit.js';
 import { loadConfig, type Config } from './config/config.js';
 import { HostRegistry } from './hosts/registry.js';
+import { compilePatterns } from './secrets/patterns.js';
+import { SecretStore } from './secrets/store.js';
 import { ConnectionPool } from './session/pool.js';
 import { SudoGrants } from './sudo/grants.js';
 import { closeAllPages, type RoundState } from './vault/gate.js';
@@ -25,6 +27,8 @@ export interface Runtime {
   readonly pool: ConnectionPool;
   readonly grants: SudoGrants;
   readonly audit: AuditLog;
+  /** Holds the values withheld from the model, and puts them back for a write. */
+  readonly secrets: SecretStore;
   /** Seals multi-round-trip state so the copy the client echoes back cannot be forged. */
   mintState(payload: RoundState, ctx: ServerContext): Promise<string>;
   readonly requestStateCodec: RequestStateCodec<RoundState>;
@@ -51,10 +55,22 @@ export async function createRuntime(configPath?: string): Promise<Runtime> {
     process.stderr.write(`ssh-mcp: ${grants.policyPath}: ${problem}\n`);
   }
 
+  // A pattern that will not compile costs itself and nothing else, exactly like
+  // a bad line in the sudo policy: the alternative is a config typo silently
+  // turning redaction off altogether.
+  const { patterns, problems: patternProblems } = compilePatterns(config.secrets.patterns);
+  for (const problem of patternProblems) {
+    process.stderr.write(`ssh-mcp: ${config.configPath}: ${problem}\n`);
+  }
+  const secrets = new SecretStore({ enabled: config.secrets.redact, patterns, paths: config.secrets.paths });
+
   // Relocking revokes approvals too: walking away for the idle timeout undoes
   // every "allow for this session".
   vault.onRelock((reason) => {
     grants.clearSession();
+    // Withheld values die with the vault too. A marker in an old transcript
+    // then names nothing, on any host.
+    secrets.clear();
     closeAllPages();
     audit.write({ event: 'lock', outcome: reason });
   });
@@ -76,6 +92,7 @@ export async function createRuntime(configPath?: string): Promise<Runtime> {
     pool,
     grants,
     audit,
+    secrets,
     requestStateCodec,
     mintState: (payload, ctx) => requestStateCodec.mint(payload, ctx),
   };

@@ -73,6 +73,17 @@ const fileSchema = z
       })
       .strict()
       .optional(),
+    secrets: z
+      .object({
+        /** Withhold secret-looking values from tool output. On by default. */
+        redact: z.boolean().optional(),
+        /** Extra patterns; group 1 is the value to withhold. A leading `(?i)` is honoured. */
+        patterns: z.array(z.string()).optional(),
+        /** Paths whose contents are never returned at all, glob-matched. */
+        paths: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
     hosts: z.record(z.string(), hostSchema).optional(),
   })
   .strict();
@@ -102,6 +113,15 @@ export interface HostConfig {
   readonly description: string | undefined;
 }
 
+export interface SecretsConfig {
+  /** When false, file contents and command output are returned exactly as they are. */
+  readonly redact: boolean;
+  /** Patterns from the config file, on top of the built-in set. */
+  readonly patterns: readonly string[];
+  /** Paths this server will not return the contents of at all. */
+  readonly paths: readonly string[];
+}
+
 export interface Config {
   readonly configPath: string;
   /** Sibling files (sudo-policy.txt, audit.jsonl) live here. */
@@ -113,6 +133,7 @@ export interface Config {
   readonly openBrowser: boolean;
   /** Loopback port for the unlock and approval pages; `0` means a fresh one each run. */
   readonly pagePort: number;
+  readonly secrets: SecretsConfig;
   readonly hosts: readonly HostConfig[];
 }
 
@@ -149,6 +170,20 @@ confirm-every-command = false
 # your browser treats a new port as a new site, and offers to save the passphrase
 # again for each one. Only change it if something else on this machine wants 8765.
 page-port = 8765
+
+[secrets]
+# Passwords and keys in a file you ask the assistant to edit would otherwise be
+# copied into its transcript. They are replaced with {{ssh-mcp:secret:…}} markers
+# instead; ssh_edit puts the real value back, so editing still works.
+redact = true
+
+# Extra things to withhold, on top of the built-in set. Group 1 is the value,
+# and a leading (?i) makes the pattern case-insensitive.
+patterns = ['(?i)^\\s*ldap_bind_pw\\s*=\\s*(.+)$']
+
+# Files whose contents are never returned at all, not even redacted. A pattern
+# with no "/" matches the file name wherever it lives.
+paths = ["/etc/app/*.env", "id_rsa"]
 
 [hosts.prod-1]
 from = "ssh-config:prod-1"   # import HostName/User/Port/IdentityFile from ~/.ssh/config
@@ -228,6 +263,11 @@ export async function loadConfig(path: string = defaultConfigPath()): Promise<Co
     confirmEveryCommand: result.data.approval?.['confirm-every-command'] ?? false,
     openBrowser: result.data.approval?.['open-browser'] ?? true,
     pagePort: result.data.approval?.['page-port'] ?? DEFAULT_PAGE_PORT,
+    secrets: {
+      redact: result.data.secrets?.redact ?? true,
+      patterns: result.data.secrets?.patterns ?? [],
+      paths: result.data.secrets?.paths ?? [],
+    },
     hosts,
   };
 }

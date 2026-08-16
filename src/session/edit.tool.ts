@@ -5,7 +5,8 @@ import { z } from 'zod';
 import { hostParameter } from '../hosts/hosts.tool.js';
 import type { ResolvedHost } from '../hosts/registry.js';
 import type { Runtime } from '../runtime.js';
-import { askForApproval, askForSudoPassword, collectSudoPassword, ensureUnlocked } from '../vault/gate.js';
+import type { SecretStore } from '../secrets/store.js';
+import { askForApproval, askForSecretValues, askForSudoPassword, collectSudoPassword, ensureUnlocked } from '../vault/gate.js';
 import { unifiedDiff } from './diff.js';
 import { applyEdits, describeFailure, type Edit } from './edits.js';
 import { exec, shellQuote, type ExecResult, type SudoMode } from './exec.js';
@@ -107,6 +108,79 @@ export function existsAsRootCommand(path: string): string {
  */
 export function replaceAsRootCommand(temp: string, path: string): string {
   return `sudo cp -- ${shellQuote(temp)} ${shellQuote(path)}`;
+}
+
+/**
+ * Puts withheld values back into the edits, without touching the originals.
+ *
+ * The copy is the point. Everything said back to the model — every failure
+ * message from {@linkcode describeFailure} — is built from the edits as they
+ * arrived, so a mistyped anchor cannot answer with the password it did not
+ * match. Only the file, the diff page and the user ever see the expanded form.
+ */
+export function expandAnchors(
+  store: SecretStore,
+  alias: string,
+  edits: readonly Edit[],
+): { readonly ok: true; readonly edits: Edit[] } | { readonly ok: false; readonly reason: string } {
+  if (store.carriesRequest(edits.map((edit) => edit.old_string))) {
+    return {
+      ok: false,
+      reason:
+        'A generate or ask request belongs in new_string, never in old_string: it is a value that does not ' +
+        'exist yet, so nothing in the file can match it.',
+    };
+  }
+
+  const expanded: Edit[] = [];
+  for (const edit of edits) {
+    const anchor = store.expand(alias, edit.old_string);
+    if (!anchor.ok) return { ok: false, reason: anchor.reason };
+    const replacement = store.expand(alias, edit.new_string);
+    if (!replacement.ok) return { ok: false, reason: replacement.reason };
+    expanded.push({ ...edit, old_string: anchor.text, new_string: replacement.text });
+  }
+
+  return { ok: true, edits: expanded };
+}
+
+/**
+ * One writer at a time per file.
+ *
+ * The re-read before the write catches a file that moved while the user was
+ * reading the diff. It does *not* catch two of this server's own edits landing
+ * together: both read the same content, both find it unchanged, both write, and
+ * the second one silently undoes the first — while both replies say "Applied".
+ * An assistant firing two edits at one config file is not an exotic case, and a
+ * reply that reports a change the file does not have is the one failure that
+ * makes every other guarantee here worthless.
+ *
+ * A queue per (host, path) is enough. It cannot serialise a person with their
+ * own shell — nothing here can, short of a compare-and-swap neither SFTP nor
+ * `cp` offers — but it makes the re-read authoritative for everything this
+ * process does, which turns the second writer's lost update into a refusal.
+ */
+const writers = new Map<string, Promise<void>>();
+
+export async function oneWriterAtATime<T>(key: string, work: () => Promise<T>): Promise<T> {
+  const previous = writers.get(key) ?? Promise.resolve();
+
+  let done!: () => void;
+  const mine = new Promise<void>((resolve) => {
+    done = resolve;
+  });
+  const chain = previous.then(() => mine);
+  writers.set(key, chain);
+
+  // Never rejects: a failed write must not wedge the queue for the next caller.
+  await previous.catch(() => {});
+  try {
+    return await work();
+  } finally {
+    done();
+    // Only if nobody queued behind us, so a live chain is never dropped.
+    if (writers.get(key) === chain) writers.delete(key);
+  }
 }
 
 /** What was on the host before the edits, and how it had to be read. */
@@ -404,6 +478,81 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
     }
   };
 
+  /**
+   * Turns the edits the model wrote into the edits that will be applied.
+   *
+   * Three kinds of marker meet here. A `secret` marker is a value withheld from
+   * an earlier `ssh_get` and is put back. A `generate` request is a value the
+   * server invents, so a rotated password is never authored in the transcript.
+   * An `ask` request is one the user types on a page, for a secret that comes
+   * from somewhere else entirely.
+   *
+   * All three are resolved before the diff is drawn, because the page has to
+   * show what the file will actually contain. Approving a diff full of markers
+   * would be approving a change nobody can read, which is the thing `ssh_put`
+   * was removed for.
+   */
+  const resolveSecrets = async (
+    alias: string,
+    path: string,
+    edits: readonly Edit[],
+  ): Promise<Step<{ edits: Edit[]; markers: readonly string[] }>> => {
+    const store = runtime.secrets;
+
+    const anchored = expandAnchors(store, alias, edits);
+    if (!anchored.ok) return stop(textResult(`${anchored.reason} Nothing was written.`, true));
+    const expanded = anchored.edits;
+
+    const replacements = expanded.map((edit) => edit.new_string);
+    const asked = store.pendingAsks(alias, replacements);
+    if (asked.length > 0) {
+      const outcome = await askForSecretValues({
+        key: `secret-values:${alias}:${asked.join(',')}`,
+        title: `Values for ${alias}`,
+        subject: asked.join(', '),
+        detail: [`host: ${alias}`, 'typed here, never sent to the model'],
+        names: asked,
+        onSubmit: (values) => {
+          for (const name of asked) store.remember(alias, name, values.get(name) ?? '');
+        },
+        openBrowser: runtime.config.openBrowser,
+      });
+
+      if (outcome.kind === 'pending') {
+        runtime.audit.write({ event: 'file', outcome: 'secret-asked', host: alias, detail: asked.join(', ') });
+        return stop(
+          textResult(
+            `This edit needs value(s) the user must type: ${asked.join(', ')}.\n\n` +
+              (outcome.opened
+                ? `A page has been opened in their browser. Ask them to fill it in and say when they have, then ` +
+                  `run ssh_edit again with the same arguments. If no window appeared:\n\n${outcome.url}`
+                : `Show them this link, then run ssh_edit again with the same arguments:\n\n${outcome.url}`) +
+              `\n\nNothing was written.`,
+            true,
+          ),
+        );
+      }
+    }
+
+    // Scoped to the call, not the session: the round that draws the diff and
+    // the round that applies it are the same arguments and must produce the
+    // same password, while a later, different edit must get its own.
+    const requested = store.resolveRequests(alias, replacements, `${path}\0${JSON.stringify(edits)}`);
+    if (!requested.ok) {
+      // Unreachable while `pendingAsks` and `resolveRequests` read the same
+      // map, and loud anyway: the silent version writes the literal request
+      // text into the file as if it were the password.
+      return stop(
+        textResult(`No value has been given for ${requested.missing.join(', ')} on ${alias}. Nothing was written.`, true),
+      );
+    }
+
+    return carryOn({
+      edits: expanded.map((edit, index) => ({ ...edit, new_string: requested.texts[index]! })),
+      markers: requested.markers,
+    });
+  };
+
   server.registerTool(
     'ssh_edit',
     {
@@ -412,7 +561,10 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
         'Changes a text file on a host by replacing exact snippets of it. The user is shown a unified diff of ' +
         'the result on a page and must approve it before anything is written — so this is the way to change ' +
         'a config file, including one owned by root, which it writes through sudo. Read the file with ssh_get ' +
-        'first so old_string matches it exactly. To create a file, pass a single edit with an empty old_string.',
+        'first so old_string matches it exactly, and copy any {{ssh-mcp:secret:…}} marker it returned verbatim: ' +
+        'the real value is put back before the file is matched and written. To set a value nobody should have ' +
+        'to see, put {{ssh-mcp:generate:32}} in new_string for a random one, or {{ssh-mcp:ask:some-name}} to ' +
+        'have the user type it. To create a file, pass a single edit with an empty old_string.',
       inputSchema: z.object({
         host: hostParameter(runtime),
         path: z.string().min(1).describe('Absolute path to the file, e.g. "/etc/postgresql/16/main/postgresql.conf".'),
@@ -439,6 +591,15 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
       if (declined) return declined;
 
       const host = runtime.hosts.require(alias);
+
+      // Markers become values here, before anything is read or matched. From
+      // this line down the edits hold real secrets, and the only things that
+      // may see them are the file, the diff page and the user: `edits` — the
+      // marker form — is what every message back to the model is built from.
+      const resolved = await resolveSecrets(alias, path, edits as readonly Edit[]);
+      if (resolved.done) return resolved.result;
+      const { edits: realEdits, markers } = resolved.value;
+
       const client = await runtime.pool.get(host);
       const wrapper = await sftp(client);
 
@@ -447,9 +608,12 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
       const existing = before.value;
       const beforeText = existing.kind === 'absent' ? '' : existing.text;
 
-      const outcome = applyEdits(beforeText, edits as readonly Edit[], existing.kind !== 'absent');
+      const outcome = applyEdits(beforeText, realEdits, existing.kind !== 'absent');
       if (!outcome.ok) {
         runtime.audit.write({ event: 'file', outcome: `edit-rejected: ${outcome.failure.kind}`, host: alias, detail: path });
+        // The marker form deliberately: `describeFailure` quotes the anchor
+        // back, and the expanded one would put the secret in the transcript on
+        // the one path where nobody approved anything.
         return textResult(describeFailure(outcome.failure, edits as readonly Edit[], path), true);
       }
 
@@ -550,62 +714,76 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
         return textResult(`You denied this change. ${path} on ${alias} is untouched.`, true);
       }
 
-      // The file could have moved between the diff and the answer. Across
-      // rounds the key already covers that — a changed file is a different key
-      // and so a different question — but within this one nothing has looked
-      // since, and a write on top of someone else's edit is exactly what the
-      // diff was supposed to rule out.
-      const now = await readExisting(ctx, wrapper, client, host, path);
-      if (now.done) return now.result;
-      const stillThere = now.value.kind === 'absent' ? '' : now.value.text;
-      if (now.value.kind !== existing.kind || fingerprint(stillThere) !== fingerprint(beforeText)) {
-        runtime.audit.write({ event: 'file', outcome: 'edit-changed', host: alias, detail: `${path} changed after approval` });
-        return textResult(
-          `${path} on ${alias} changed after the diff was approved, so nothing was written. Run ssh_edit again ` +
-            `to see a diff against the file as it is now.`,
-          true,
-        );
-      }
+      // Everything from here to the write is one writer at a time, so the
+      // re-read below is the last word on what the file holds. Without the
+      // queue two edits approved together both re-read the old content, both
+      // write, and the second quietly undoes the first while both say
+      // "Applied".
+      const attempt = await oneWriterAtATime(`${alias}:${path}`, async (): Promise<Step<'user' | 'sudo'>> => {
+        // The file could have moved between the diff and the answer. Across
+        // rounds the key already covers that — a changed file is a different
+        // key and so a different question — but within this one nothing has
+        // looked since, and a write on top of someone else's edit is exactly
+        // what the diff was supposed to rule out.
+        const now = await readExisting(ctx, wrapper, client, host, path);
+        if (now.done) return stop(now.result);
+        const stillThere = now.value.kind === 'absent' ? '' : now.value.text;
+        if (now.value.kind !== existing.kind || fingerprint(stillThere) !== fingerprint(beforeText)) {
+          runtime.audit.write({ event: 'file', outcome: 'edit-changed', host: alias, detail: `${path} changed after approval` });
+          return stop(
+            textResult(
+              `${path} on ${alias} changed after the diff was approved, so nothing was written. Run ssh_edit again ` +
+                `to see a diff against the file as it is now.`,
+              true,
+            ),
+          );
+        }
 
-      // Which route the write actually took, rather than which one was
-      // predicted. Saying "as root via sudo" on a reply that in fact wrote as
-      // the connecting user is worse than saying nothing: it invents an owner
-      // and a mode that the file does not have.
-      let route: 'user' | 'sudo';
-      try {
-        if (existing.kind === 'absent') {
-          // Only a create is decided here rather than probed. There is no
-          // non-destructive way to ask SFTP whether a directory is writable,
-          // and by this point the user has approved the file being made — so
-          // attempting it as themselves first is the cheapest honest answer,
-          // and keeps a file in their own home from arriving owned by root.
-          try {
-            await createDirectly(wrapper, path, content, 0o644);
+        // Which route the write actually took, rather than which one was
+        // predicted. Saying "as root via sudo" on a reply that in fact wrote as
+        // the connecting user is worse than saying nothing: it invents an owner
+        // and a mode that the file does not have.
+        let route: 'user' | 'sudo';
+        try {
+          if (existing.kind === 'absent') {
+            // Only a create is decided here rather than probed. There is no
+            // non-destructive way to ask SFTP whether a directory is writable,
+            // and by this point the user has approved the file being made — so
+            // attempting it as themselves first is the cheapest honest answer,
+            // and keeps a file in their own home from arriving owned by root.
+            try {
+              await createDirectly(wrapper, path, content, 0o644);
+              route = 'user';
+            } catch (cause) {
+              if (!deniedByPermissions(cause) || host.sudo === 'off') throw cause;
+              const written = await writeAsRoot(wrapper, client, alias, path, content, true);
+              if (written.done) {
+                runtime.audit.write({ event: 'file', outcome: 'edit-failed', host: alias, detail: path });
+                return stop(written.result);
+              }
+              route = 'sudo';
+            }
+          } else if (direct) {
+            await overwriteDirectly(wrapper, path, content);
             route = 'user';
-          } catch (cause) {
-            if (!deniedByPermissions(cause) || host.sudo === 'off') throw cause;
-            const written = await writeAsRoot(wrapper, client, alias, path, content, true);
+          } else {
+            const written = await writeAsRoot(wrapper, client, alias, path, content, false);
             if (written.done) {
               runtime.audit.write({ event: 'file', outcome: 'edit-failed', host: alias, detail: path });
-              return written.result;
+              return stop(written.result);
             }
             route = 'sudo';
           }
-        } else if (direct) {
-          await overwriteDirectly(wrapper, path, content);
-          route = 'user';
-        } else {
-          const written = await writeAsRoot(wrapper, client, alias, path, content, false);
-          if (written.done) {
-            runtime.audit.write({ event: 'file', outcome: 'edit-failed', host: alias, detail: path });
-            return written.result;
-          }
-          route = 'sudo';
+        } catch (cause) {
+          runtime.audit.write({ event: 'file', outcome: 'edit-failed', host: alias, detail: `${path}: ${(cause as Error).message}` });
+          return stop(textResult(`Writing ${path} on ${alias} failed: ${(cause as Error).message}`, true));
         }
-      } catch (cause) {
-        runtime.audit.write({ event: 'file', outcome: 'edit-failed', host: alias, detail: `${path}: ${(cause as Error).message}` });
-        return textResult(`Writing ${path} on ${alias} failed: ${(cause as Error).message}`, true);
-      }
+
+        return carryOn(route);
+      });
+
+      if (attempt.done) return attempt.result;
+      const route = attempt.value;
 
       runtime.vault.touch();
       runtime.audit.write({
@@ -624,7 +802,14 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
           (created && route === 'sudo'
             ? ` It is a new file owned by root with mode 0644 — use ssh_sudo to chown or chmod it if that is wrong.`
             : '') +
-          (!created ? ` Its owner and mode are unchanged.` : ''),
+          (!created ? ` Its owner and mode are unchanged.` : '') +
+          // The handle for a value that was just invented or typed. Without it
+          // the second half of a rotation — telling the database about the new
+          // password — would have no way to name it but to know it.
+          (markers.length === 0
+            ? ''
+            : `\n\nThe value(s) written are held as ${markers.join(', ')} until the vault relocks. ssh_sudo ` +
+              `expands them, and always asks the user to approve the command first.`),
       );
     },
   );

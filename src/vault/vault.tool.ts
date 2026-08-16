@@ -7,7 +7,7 @@ export function registerVaultTools(server: McpServer, runtime: Runtime): void {
     'ssh_status',
     {
       title: 'SSH status',
-      description: 'Whether ssh-mcp is locked, and which sudo approvals are currently in force.',
+      description: 'Whether ssh-mcp is locked, which sudo approvals are in force, and whether secrets are being withheld.',
       inputSchema: z.object({}),
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -15,7 +15,13 @@ export function registerVaultTools(server: McpServer, runtime: Runtime): void {
       content: [
         {
           type: 'text',
-          text: `${runtime.vault.status()}\n\nsudo grants:\n${runtime.grants.describe()}\n\npolicy file: ${runtime.grants.policyPath}\naudit log:   ${runtime.audit.path}`,
+          // Whether redaction is on is worth a line here for the same reason
+          // the loaded sudo rules are: it is how a person confirms that what
+          // they put in ssh-mcp.toml actually took.
+          text:
+            `${runtime.vault.status()}\n\nsudo grants:\n${runtime.grants.describe()}\n\n` +
+            `secrets:     ${runtime.secrets.enabled ? 'withheld from file reads and command output' : 'not withheld ([secrets] redact = false)'}\n` +
+            `policy file: ${runtime.grants.policyPath}\naudit log:   ${runtime.audit.path}`,
         },
       ],
     }),

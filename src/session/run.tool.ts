@@ -33,6 +33,16 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
     ctx: ServerContext,
     alias: string,
     cmd: string,
+    /**
+     * The command as the model wrote it, which is what the echo and the audit
+     * log record.
+     *
+     * The two differ only when a withheld secret was expanded into `cmd`. The
+     * user has seen the expanded line on the approval page; putting it in the
+     * transcript and in `audit.jsonl` as well would give back what the marker
+     * exists to keep out of them.
+     */
+    shown: string,
     timeoutSeconds: number | undefined,
     gate: (host: ResolvedHost) => SudoGate | Promise<SudoGate>,
   ): Promise<{
@@ -67,7 +77,7 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
     // attempted, instead of the reader having to trust a bare tool name. It goes
     // on the failures too — a command that could not even connect is exactly
     // when you want to see what it was.
-    const echo = promptLine(host.user, alias, cmd);
+    const echo = promptLine(host.user, alias, shown);
 
     // Explicitly tagged rather than probed with `in`: `CallToolResult` carries an
     // index signature, so a structural check would not narrow it.
@@ -94,7 +104,7 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
         };
       } catch (cause) {
         const message = (cause as Error).message;
-        runtime.audit.write({ event: 'run', outcome: 'failed', host: alias, command: cmd, detail: message });
+        runtime.audit.write({ event: 'run', outcome: 'failed', host: alias, command: shown, detail: message });
         return { kind: 'unreachable', result: { content: [{ type: 'text', text: `${echo}\n${message}` }], isError: true } };
       }
     };
@@ -109,7 +119,7 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
     // through; that is why the preamble authenticates once, up front, rather
     // than letting each sudo discover the problem for itself.
     if (attempt.exec.needsSudoPassword) {
-      runtime.audit.write({ event: 'sudo', outcome: 'password-required', host: alias, command: cmd });
+      runtime.audit.write({ event: 'sudo', outcome: 'password-required', host: alias, command: shown });
       const pending = await askForSudoPassword(
         ctx,
         runtime.vault,
@@ -133,12 +143,16 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
       event: 'run',
       outcome: finished.timedOut ? 'timeout' : `exit ${finished.exitCode ?? '?'}`,
       host: alias,
-      command: cmd,
+      command: shown,
     });
+
+    // Output is withheld but never written back: `exec` truncates to a byte and
+    // line budget, so a value captured here may be a prefix of the real one.
+    const output = runtime.secrets.redact(alias, formatExecResult(finished), { writable: false });
 
     return {
       result: {
-        content: [{ type: 'text', text: `${echo}\n${formatExecResult(finished)}` }],
+        content: [{ type: 'text', text: `${echo}\n${output.text}` }],
         isError: finished.timedOut || (finished.exitCode !== 0 && finished.exitCode !== null),
       },
       ran: true,
@@ -162,9 +176,26 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
         ? { _meta: { 'anthropic/requiresUserInteraction': true } }
         : {}),
     },
-    async ({ host: alias, cmd, timeout_seconds }, ctx) =>
-      (
-        await execute(ctx, alias, cmd, timeout_seconds, (host) =>
+    async ({ host: alias, cmd, timeout_seconds }, ctx) => {
+      // No expansion here, ever. This is the tool with no page in front of it,
+      // so a marker it expanded would be a secret retrieved by `echo`.
+      if (runtime.secrets.carriesMarker(cmd)) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text:
+                'ssh_run does not expand {{ssh-mcp:secret:…}} markers, because nothing shows the user what the ' +
+                'command would really be. Use ssh_sudo for a command that needs the value: it puts the expanded ' +
+                'line in front of them and waits.\n\nNothing was run.',
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return (
+        await execute(ctx, alias, cmd, cmd, timeout_seconds, (host) =>
           gateUnprivileged({
             alias,
             hostSudo: host.sudo,
@@ -177,7 +208,8 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
               runtime.audit.write({ event: 'sudo', outcome, host: alias, command: cmd, detail }),
           }),
         )
-      ).result,
+      ).result;
+    },
   );
 
   server.registerTool(
@@ -199,15 +231,27 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
       // browser can answer it.
     },
     async ({ host: alias, cmd, timeout_seconds }, ctx) => {
-      const { result, ran } = await execute(ctx, alias, cmd, timeout_seconds, (host) =>
+      // The expanded line is what gets parsed, denylisted, shown and run.
+      // Analysing the marker form and running the expanded one is the
+      // `sudo $(cat /tmp/x)` mistake: an asked value is arbitrary text, and a
+      // separator inside it would be a segment nobody assessed.
+      const carriesSecret = runtime.secrets.carriesMarker(cmd);
+      const expansion = runtime.secrets.expand(alias, cmd);
+      if (!expansion.ok) {
+        return { content: [{ type: 'text', text: `${expansion.reason} Nothing was run.` }], isError: true };
+      }
+      const real = expansion.text;
+
+      const { result, ran } = await execute(ctx, alias, real, cmd, timeout_seconds, (host) =>
         gatePrivileged({
           alias,
           hostSudo: host.sudo,
-          command: cmd,
+          command: real,
           grants: runtime.grants,
           sessionTtlMs: runtime.vault.idleTimeoutMs,
           policyPath: runtime.grants.policyPath,
           guardFileWrites: host.fileWrites !== 'off',
+          carriesSecret,
           record: (outcome, detail) => runtime.audit.write({ event: 'sudo', outcome, host: alias, command: cmd, detail }),
           approve: async (eligibility) => {
             // What a person actually decides on: which commands run as root, and
@@ -220,11 +264,16 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
             const outcome = await askForApproval({
               // Keyed by host and command, so two different commands cannot
               // share a page and have one answer stand for both.
-              key: `approve:${alias}:${cmd}`,
-              title: `Run this with sudo on ${alias}?`,
-              subject: cmd,
+              key: `approve:${alias}:${real}`,
+              title: carriesSecret
+                ? `Run this on ${alias}? It carries a withheld value.`
+                : `Run this with sudo on ${alias}?`,
+              // The expanded line, so the value the model never saw is read by
+              // the one person who should see it before it runs.
+              subject: real,
               detail: [
                 `host: ${alias} (${host.user}@${host.host})`,
+                ...(carriesSecret ? ['a value withheld from the model has been put into this line'] : []),
                 ...eligibility.invocations.map((invocation) => `as root: ${invocation.segment.text}`),
                 ...(rest > 0
                   ? [`also: ${rest} other command${rest === 1 ? '' : 's'} on the same line, as ${host.user}`]
@@ -234,7 +283,7 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
               choices: [
                 { value: 'deny', label: 'Deny', hint: 'run nothing' },
                 { value: 'once', label: 'Allow once', hint: 'this command, right now' },
-                ...(eligibility.grantable
+                ...(eligibility.grantable && !carriesSecret
                   ? [
                       {
                         value: 'session',
@@ -273,7 +322,9 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
       // that got past it — including a command that then failed to connect.
       // Only once it has actually run: saying "allowed for this session" on a
       // reply that is still asking for a password reads as though it went ahead.
-      const rules = ran ? persistableRules(alias, cmd) : undefined;
+      // Never for a line carrying a secret: the rule would be printed with the
+      // real value in it, and a policy file is the last place that belongs.
+      const rules = ran && !carriesSecret ? persistableRules(alias, cmd) : undefined;
       if (rules && 'content' in result) {
         const content = result.content as Array<{ type: string; text?: string }>;
         const last = content[content.length - 1];

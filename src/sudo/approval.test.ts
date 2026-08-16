@@ -308,3 +308,80 @@ describe('the gates', () => {
     });
   });
 });
+
+/**
+ * A command holding a value the model never saw.
+ *
+ * `ssh_sudo` expands `{{ssh-mcp:secret:…}}` markers so a rotated password can be
+ * given to the database that has to accept it. These are the rules that keep
+ * that from becoming a way to run something unseen, or to have it remembered.
+ */
+describe('a line carrying a withheld secret', () => {
+  const options = (command: string, overrides: Partial<SudoGateOptions> = {}): SudoGateOptions => ({
+    alias: 'lab',
+    hostSudo: 'ask',
+    command,
+    grants: new SudoGrants('/dev/null'),
+    sessionTtlMs: 60_000,
+    policyPath: '/dev/null',
+    guardFileWrites: true,
+    record: () => {},
+    carriesSecret: true,
+    ...overrides,
+  });
+
+  it('is_always_put_to_the_user_even_with_no_sudo_on_it', async () => {
+    // The gap this closes: ssh_sudo runs an unprivileged line without asking,
+    // and `psql -c "ALTER USER …"` needs no sudo at all.
+    const approve = vi.fn(async () => 'once' as const);
+    const gate = await gatePrivileged({ ...options(`psql -c "ALTER USER app PASSWORD 'x'"`), approve });
+
+    expect(gate.allowed).toBe(true);
+    expect(approve).toHaveBeenCalled();
+  });
+
+  it('is_not_covered_by_a_rule_the_user_already_agreed_to', async () => {
+    const grants = new SudoGrants('/dev/null');
+    grants.grantForSession('lab', ['mysql', '**'], 60_000);
+
+    const approve = vi.fn(async () => 'once' as const);
+    await gatePrivileged({ ...options('sudo mysql -pletmein -e "flush privileges"', { grants }), approve });
+
+    expect(approve).toHaveBeenCalled();
+  });
+
+  it('is_never_remembered_even_if_the_user_picks_for_this_session', async () => {
+    const grants = new SudoGrants('/dev/null');
+    const gate = await gatePrivileged({
+      ...options('sudo mysql -pletmein -e "flush privileges"', { grants }),
+      approve: async () => 'session' as const,
+    });
+
+    expect(gate.allowed).toBe(true);
+    expect(grants.find('lab', ['mysql', '-pletmein', '-e', 'flush privileges'])).toBeUndefined();
+    expect(grants.describe()).toContain('no sudo grants');
+  });
+
+  it('is_still_refused_when_the_denylist_says_so', async () => {
+    const approve = vi.fn();
+    const gate = await gatePrivileged({ ...options('sudo -s'), approve });
+
+    expect(gate.allowed).toBe(false);
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  it('leaves_an_ordinary_line_exactly_as_it_was', async () => {
+    // Without a marker nothing changes: no page for an unprivileged line, and a
+    // stored rule still covers what it always covered.
+    const grants = new SudoGrants('/dev/null');
+    grants.grantForSession('lab', ['systemctl', 'restart', '*'], 60_000);
+    const approve = vi.fn();
+
+    expect((await gatePrivileged({ ...options('uptime', { carriesSecret: false }), approve })).allowed).toBe(true);
+    expect(
+      (await gatePrivileged({ ...options('sudo systemctl restart nginx', { carriesSecret: false, grants }), approve }))
+        .allowed,
+    ).toBe(true);
+    expect(approve).not.toHaveBeenCalled();
+  });
+});
