@@ -240,6 +240,91 @@ export interface SudoInvocation {
   readonly unparseableFlag: string | undefined;
 }
 
+/**
+ * A `sudo` that runs without this parser being able to say what it runs.
+ *
+ * `sudoInvocations` reads the first word of each segment, which is where sudo
+ * stands in every line a rule could be matched against. It is not the only place
+ * a shell will execute one, and a sudo it misses is a sudo the denylist never
+ * saw and no page ever showed — on a NOPASSWD host, root with nobody asked.
+ *
+ * Two shapes are recognised, and they are not equally certain:
+ *
+ * - Inside a command substitution. Syntactically unambiguous: the parser saw the
+ *   `$(` or the backtick itself, so `PGPASSWORD=$(sudo sed …)` is a sudo call
+ *   whatever else is on the line.
+ * - Passed to a command that runs its arguments (`env`, `xargs`, `do …`). This
+ *   one cannot be decided in general — nothing syntactic separates
+ *   `env FOO=1 sudo systemctl restart nginx` from `grep sudo /var/log/auth.log`,
+ *   and refusing both would leave no way to grep for the word. So it is a list of
+ *   the forms that occur, not a proof that there are no others.
+ */
+export interface UnaccountedSudo {
+  readonly segment: CommandSegment;
+  /** Reads after "…, because it is": `inside an expansion`, `an argument to env`. */
+  readonly reason: string;
+}
+
+/**
+ * `$(sudo …)` or `` `sudo …` ``, with or without a path in front of sudo.
+ *
+ * Matched against the segment's raw text as well as its tokens, so a space after
+ * the `$(` does not hide it. That reads quoting it cannot see, so a literal
+ * `'$(sudo'` searched for with grep is refused too — a false refusal that fails
+ * closed, which is the right way round.
+ */
+const SUDO_IN_SUBSTITUTION = /(?:\$\(|`)\s*(?:\S*\/)?(?:sudo|doas)\b/;
+
+/** A word that starts a command line of its own, as `sh -c "sudo …"` does. */
+const STARTS_WITH_SUDO = /^\s*(?:\S*\/)?(?:sudo|doas)\b/;
+
+/** Commands that run one of their arguments, so a `sudo` among them is a sudo call. */
+const ARGUMENT_RUNNERS = new Set([
+  'env', 'xargs', 'nohup', 'timeout', 'time', 'nice', 'ionice', 'stdbuf', 'setsid', 'watch', 'parallel',
+  // Shell keywords: the line is split on `;`, so `do` and friends head a segment.
+  'do', 'then', 'else', 'elif',
+]);
+
+/**
+ * Flags whose value is a command, so the word after one is executed.
+ *
+ * `-c` is deliberately absent: it is `sh -c` and it is also `grep -c`, so the
+ * word after it says nothing. `sh -c 'sudo …'` is caught by the quoted-command
+ * check instead, which reads what the word actually is.
+ */
+const COMMAND_VALUED_FLAGS = new Set(['-exec', '-execdir']);
+
+export function unaccountedSudo(parsed: ParsedCommandLine): UnaccountedSudo | undefined {
+  for (const segment of parsed.segments) {
+    if (SUDO_IN_SUBSTITUTION.test(segment.text)) return { segment, reason: 'inside an expansion' };
+
+    for (const [index, token] of segment.argv.entries()) {
+      if (SUDO_IN_SUBSTITUTION.test(token)) return { segment, reason: 'inside an expansion' };
+      if (index === 0) continue;
+
+      // A word holding a whole command line: `sh -c "sudo systemctl restart x"`.
+      // One word that is just `sudo` is not this — that is `grep sudo`.
+      if (/\s/.test(token) && STARTS_WITH_SUDO.test(token)) {
+        return { segment, reason: 'inside a quoted command line' };
+      }
+
+      if (!isSudo(token)) continue;
+
+      const head = baseCommand(segment.argv[0]!);
+      if (ARGUMENT_RUNNERS.has(head)) return { segment, reason: `an argument to ${head}` };
+
+      const before = segment.argv[index - 1]!;
+      if (COMMAND_VALUED_FLAGS.has(before)) return { segment, reason: `the command after ${before}` };
+    }
+  }
+
+  return undefined;
+}
+
+function baseCommand(word: string): string {
+  return word.split(/[\\/]/).pop() ?? word;
+}
+
 /** sudo options that consume the following argument. */
 const FLAGS_WITH_VALUE = new Set(['-u', '-g', '-p', '-C', '-h', '-r', '-t', '-U', '-T', '-D', '-R']);
 /** sudo options that stand alone. */

@@ -127,6 +127,39 @@ describe('which lines an existing rule may be matched against', () => {
   });
 });
 
+/**
+ * A sudo this parser cannot turn into an invocation is a sudo nobody was asked
+ * about: the denylist never sees it, no page shows it, and on a host with a warm
+ * timestamp cache or a NOPASSWD rule it simply runs as root.
+ */
+describe('a sudo the parser cannot account for', () => {
+  it.each([
+    'PGPASSWORD=$(sudo sed -n s/^p=//p /etc/app.env) psql -h localhost',
+    'echo `sudo cat /etc/shadow`',
+    'env FOO=1 sudo systemctl restart nginx',
+    'xargs -I{} sudo systemctl restart {}',
+    'for h in a b; do sudo systemctl restart $h; done',
+    'sh -c "sudo systemctl restart nginx"',
+    'find /etc -name "*.conf" -exec sudo chmod 600 {} ;',
+  ])('%s is not mistaken for an unprivileged line', (command) => {
+    const result = assess(command);
+    expect(result.unaccountedSudo, command).toBeDefined();
+    // Not a denylist hit: the line is refused for being unreadable, not forbidden.
+    expect(result.denied).toBeUndefined();
+    expect(result.coverable).toBe(false);
+    expect(result.grantable).toBe(false);
+  });
+
+  it.each([
+    'sudo systemctl restart $(cat /tmp/service)',
+    'sudo journalctl -u nginx | grep sudo',
+    'grep -c sudo /var/log/auth.log',
+    'systemctl restart nginx',
+  ])('%s is left alone', (command) => {
+    expect(assess(command).unaccountedSudo, command).toBeUndefined();
+  });
+});
+
 describe('the file-write routing rule', () => {
   it('is reported alongside the sudo verdict, not folded into it', () => {
     expect(assess('echo x > /etc/foo').fileWrite).toBeDefined();
@@ -172,6 +205,34 @@ describe('the gates', () => {
     expect(textOf(gate)).toContain('ssh_edit');
     // The load-bearing assertion: a change nobody can read is never put to a vote.
     expect(approve).not.toHaveBeenCalled();
+  });
+
+  it('refuses a hidden sudo through ssh_run instead of running it unprivileged', () => {
+    const record = vi.fn();
+    const gate = gateUnprivileged(options('PGPASSWORD=$(sudo sed -n s/^p=//p /etc/app.env) psql -h localhost', { record }));
+
+    expect(gate.allowed).toBe(false);
+    expect(textOf(gate)).toContain('ssh_sudo');
+    expect(record).toHaveBeenCalledWith('refused', expect.stringContaining('inside an expansion'));
+  });
+
+  it('refuses a hidden sudo through ssh_sudo without offering a page', async () => {
+    const approve = vi.fn();
+    const gate = await gatePrivileged({
+      ...options('PGPASSWORD=$(sudo sed -n s/^p=//p /etc/app.env) psql -h localhost'),
+      approve,
+    });
+
+    expect(gate.allowed).toBe(false);
+    // Approving a line that does not say which command becomes root is not consent.
+    expect(approve).not.toHaveBeenCalled();
+    expect(textOf(gate)).toContain('{{ssh-mcp:secret:');
+  });
+
+  it('refuses a hidden sudo on a host with sudo switched off, in the same words', async () => {
+    const gate = gateUnprivileged(options('env FOO=1 sudo systemctl restart nginx', { hostSudo: 'off' }));
+    expect(gate.allowed).toBe(false);
+    expect(textOf(gate)).toContain('an argument to env');
   });
 
   it('says where to put a backup when it refuses a copy', () => {

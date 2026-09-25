@@ -5,9 +5,11 @@ import { formatPattern, proposePatterns } from './matcher.js';
 import {
   parseCommandLine,
   sudoInvocations,
+  unaccountedSudo,
   type CommandSegment,
   type ParsedCommandLine,
   type SudoInvocation,
+  type UnaccountedSudo,
 } from './parse.js';
 import { detectFileWrite, type FileWrite } from './writes.js';
 
@@ -88,6 +90,14 @@ export interface Eligibility {
    * different wording in each tool.
    */
   readonly fileWrite: FileWrite | undefined;
+  /**
+   * A sudo that would run without anything being able to say what it runs.
+   *
+   * Refused by both gates rather than approved: the approval page can show the
+   * line, and the line is precisely what does not tell the reader which command
+   * becomes root.
+   */
+  readonly unaccountedSudo: UnaccountedSudo | undefined;
 }
 
 /**
@@ -138,6 +148,7 @@ export function assess(command: string): Eligibility {
   const parsed = parseCommandLine(command);
   const invocations = sudoInvocations(parsed);
   const fileWrite = detectFileWrite(parsed);
+  const unaccounted = unaccountedSudo(parsed);
 
   for (const invocation of invocations) {
     const verdict = classify(invocation);
@@ -150,6 +161,7 @@ export function assess(command: string): Eligibility {
         notGrantableBecause: verdict.reason,
         segments: parsed.segments,
         fileWrite,
+        unaccountedSudo: unaccounted,
       };
     }
   }
@@ -169,11 +181,12 @@ export function assess(command: string): Eligibility {
   return {
     invocations,
     denied: undefined,
-    coverable: invocations.length > 0 && parsed.settled && blocked === undefined,
-    grantable: invocations.length > 0 && notGrantableBecause === undefined,
+    coverable: invocations.length > 0 && parsed.settled && blocked === undefined && unaccounted === undefined,
+    grantable: invocations.length > 0 && notGrantableBecause === undefined && unaccounted === undefined,
     notGrantableBecause,
     segments: parsed.segments,
     fileWrite,
+    unaccountedSudo: unaccounted,
   };
 }
 
@@ -207,6 +220,24 @@ function writeRefusal(tool: 'ssh_run' | 'ssh_sudo', write: FileWrite): string {
 }
 
 /**
+ * Why a sudo the parser could not account for is refused, and what to do instead.
+ *
+ * Both tools say the same thing, because the answer is the same for both: give
+ * the privileged command a call of its own, where it can be read and approved as
+ * itself.
+ */
+function unaccountedRefusal(unaccounted: UnaccountedSudo): CallToolResult {
+  return textResult(
+    `Refused: \`${unaccounted.segment.text}\` runs sudo ${unaccounted.reason}, so nothing here can say which ` +
+      `command becomes root — the denylist cannot check it and the approval page could only show you the line.\n\n` +
+      `Run the privileged command as its own ssh_sudo call. If you need a value out of a root-only file for an ` +
+      `unprivileged command, read the file first: its secrets come back as {{ssh-mcp:secret:…}} markers, and ` +
+      `ssh_sudo puts the real value back after the user has seen the expanded line.\n\nNothing was run.`,
+    true,
+  );
+}
+
+/**
  * The write check, shared by both gates.
  *
  * Runs after the denylist — `sudo -s > /etc/foo` is a root shell first and a
@@ -232,6 +263,14 @@ function writeRefusalFor(
 
 /** Shared first pass: the refusals that apply however consent was obtained. */
 function hardRefusal(options: SudoGateOptions, eligibility: Eligibility): CallToolResult | undefined {
+  // Before the host's own switch, so a line whose sudo cannot be read is refused
+  // in the same words whether or not sudo is allowed here at all.
+  const { unaccountedSudo: unaccounted } = eligibility;
+  if (unaccounted) {
+    options.record('refused', `sudo ${unaccounted.reason}: ${unaccounted.segment.text}`);
+    return unaccountedRefusal(unaccounted);
+  }
+
   if (options.hostSudo === 'off') {
     options.record('refused', 'sudo is off for this host');
     return textResult(`sudo is switched off for ${options.alias} in ssh-mcp.toml. Nothing was run.`, true);
@@ -262,8 +301,9 @@ export function gateUnprivileged(options: SudoGateOptions): SudoGate {
   const { invocations } = eligibility;
 
   // `hardRefusal` only ever speaks about sudo, so a line without any still runs
-  // on a host where sudo is switched off.
-  if (invocations.length > 0) {
+  // on a host where sudo is switched off. A sudo it could not account for counts
+  // as one being there: that is the whole point of noticing it.
+  if (invocations.length > 0 || eligibility.unaccountedSudo) {
     const refusal = hardRefusal(options, eligibility);
     if (refusal) return { allowed: false, result: refusal };
   }
@@ -308,7 +348,7 @@ export async function gatePrivileged(
   // value nobody would recognise in the policy file.
   const grantable = eligibility.grantable && options.carriesSecret !== true;
 
-  if (invocations.length > 0) {
+  if (invocations.length > 0 || eligibility.unaccountedSudo) {
     const refusal = hardRefusal(options, eligibility);
     if (refusal) return { allowed: false, result: refusal };
   }

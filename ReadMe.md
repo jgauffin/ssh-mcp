@@ -89,6 +89,12 @@ would hand the second command root as well, so instead:
    `systemctl restart nginx --now`.
 6. `sudo`'s own flags are parsed. Anything not understood (a bundled `-nS`, an
    unknown `--flag`) makes the invocation ungrantable rather than guessed at.
+7. A `sudo` that runs somewhere a rule could never be matched — inside `$(…)` or
+   backticks, as an argument to `env`/`xargs`/`do`, inside `sh -c "…"` — is
+   **refused by both tools**, not approved. The page could show the line, and the
+   line is what fails to say which command becomes root. Give the privileged part
+   its own `ssh_sudo` call. To use a root-only value in an unprivileged command,
+   read the file first: its secrets come back as markers that `ssh_sudo` expands.
 
 `grep "a;b" /etc/hosts` is still a plain command; the `;` is quoted.
 
