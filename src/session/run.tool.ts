@@ -66,7 +66,7 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
     );
     if (!unlocked.ready) return { result: unlocked.result, ran: false };
 
-    const declined = await collectSudoPassword(ctx, runtime.vault, alias);
+    const declined = await collectSudoPassword(ctx, runtime.vault, alias, host.user, runtime.config.openBrowser);
     if (declined) return { result: declined, ran: false };
 
     const verdict = await gate(host);

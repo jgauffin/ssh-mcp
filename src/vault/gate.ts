@@ -524,6 +524,45 @@ export async function ensureUnlocked(
   };
 }
 
+/** The page that asks for a remote sudo password, shared by every route to it. */
+function sudoPasswordForm(alias: string, user: string): { title: string; detail: string[]; fields: SecretField[] } {
+  return {
+    title: `sudo password for ${alias}`,
+    detail: [`host: ${alias}`, `remote user: ${user}`],
+    fields: [{ name: 'sudo-password', label: `Password for ${user} on ${alias}` }],
+  };
+}
+
+/** Consumes a submitted sudo password; it goes to the vault and nowhere else. */
+function storeSudoPassword(vault: Vault, alias: string): (values: Map<string, string>) => Promise<undefined> {
+  return async (values) => {
+    vault.setSudoPassword(alias, values.get('sudo-password') ?? '');
+    return undefined;
+  };
+}
+
+/**
+ * Opens the page ourselves and either carries on or relays its link.
+ *
+ * `undefined` means the password is in hand.
+ */
+async function collectSudoPasswordDirectly(
+  vault: Vault,
+  alias: string,
+  user: string,
+  openBrowser: boolean,
+  why: string,
+): Promise<CallToolResult | undefined> {
+  const { accepted, url, opened } = await collectNow(
+    `sudo:${alias}`,
+    sudoPasswordForm(alias, user),
+    storeSudoPassword(vault, alias),
+    openBrowser,
+  );
+  if (accepted) return undefined;
+  return textResult(relayed(why, url, opened), true);
+}
+
 /**
  * Picks up a sudo password the user submitted in the previous round.
  *
@@ -535,13 +574,34 @@ export async function ensureUnlocked(
  * unlock flow consumes its own id, and only leaves one behind when the vault
  * was already open.
  */
-export async function collectSudoPassword(ctx: ServerContext, vault: Vault, alias: string): Promise<CallToolResult | undefined> {
-  const page = collect(ctx.mcpReq.requestState<RoundState>()?.pageId);
+export async function collectSudoPassword(
+  ctx: ServerContext,
+  vault: Vault,
+  alias: string,
+  user: string,
+  openBrowser: boolean,
+): Promise<CallToolResult | undefined> {
+  const state = ctx.mcpReq.requestState<RoundState>();
+  const page = collect(state?.pageId);
   if (!page) return undefined;
 
   const response = inputResponse(ctx.mcpReq.inputResponses, 'sudo-password');
   if (response.kind === 'elicit' && response.action !== 'accept') {
     page.close();
+
+    // The same auto-decline the unlock round gets, and it has to be handled the
+    // same way: reported as a refusal, it leaves every privileged tool with no
+    // route to the password at all, because this is the only one there is.
+    if (answeredWithoutBeingAsked(state?.askedAt)) {
+      return collectSudoPasswordDirectly(
+        vault,
+        alias,
+        user,
+        openBrowser,
+        `${alias} asks for a password before it will run sudo, and this client dismissed the prompt without showing it.`,
+      );
+    }
+
     return textResult(`Declined. No sudo password for ${alias}, so nothing was run.`, true);
   }
 
@@ -567,27 +627,18 @@ export async function askForSudoPassword(
   alias: string,
   user: string,
 ): Promise<CallToolResult | InputRequiredResult | undefined> {
-  const form = {
-    title: `sudo password for ${alias}`,
-    detail: [`host: ${alias}`, `remote user: ${user}`],
-    fields: [{ name: 'sudo-password', label: `Password for ${user} on ${alias}` }],
-  };
-  const onSubmit = async (values: Map<string, string>): Promise<undefined> => {
-    vault.setSudoPassword(alias, values.get('sudo-password') ?? '');
-    return undefined;
-  };
-
   // Same reasoning as the passphrase: a client without URL-mode elicitation gets
   // the link relayed rather than an error. Asking through a form is not an
   // option — this is a password.
   const noNativePrompt = urlElicitationUnavailable(ctx, capabilities, `${user}'s password`);
   if (noNativePrompt) {
-    const { accepted, url, opened } = await collectNow(`sudo:${alias}`, form, onSubmit, openBrowser);
     // `undefined` means the password is in hand and the caller should carry on.
-    if (accepted) return undefined;
-    return textResult(
-      relayed(`${alias} asks for a password before it will run sudo, and ${noNativePrompt}.`, url, opened),
-      true,
+    return collectSudoPasswordDirectly(
+      vault,
+      alias,
+      user,
+      openBrowser,
+      `${alias} asks for a password before it will run sudo, and ${noNativePrompt}.`,
     );
   }
 
@@ -595,8 +646,8 @@ export async function askForSudoPassword(
     {
       key: 'sudo-password',
       message: `${alias} asks for a password before running sudo. Open this page to enter it — it is never sent to the model.`,
-      ...form,
-      onSubmit,
+      ...sudoPasswordForm(alias, user),
+      onSubmit: storeSudoPassword(vault, alias),
     },
     mintState,
   );

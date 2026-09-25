@@ -587,10 +587,10 @@ export function registerEditTool(server: McpServer, runtime: Runtime): void {
       );
       if (!unlocked.ready) return unlocked.result;
 
-      const declined = await collectSudoPassword(ctx, runtime.vault, alias);
-      if (declined) return declined;
-
       const host = runtime.hosts.require(alias);
+
+      const declined = await collectSudoPassword(ctx, runtime.vault, alias, host.user, runtime.config.openBrowser);
+      if (declined) return declined;
 
       // Markers become values here, before anything is read or matched. From
       // this line down the edits hold real secrets, and the only things that

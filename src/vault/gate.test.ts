@@ -1,8 +1,8 @@
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ClientCapabilities, ServerContext } from '@modelcontextprotocol/server';
+import type { CallToolResult, ClientCapabilities, ServerContext } from '@modelcontextprotocol/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { askForSudoPassword, closeAllPages } from './gate.js';
+import { askForSudoPassword, closeAllPages, collectSudoPassword, type RoundState } from './gate.js';
 import { Vault } from './vault.js';
 
 // Stands in for the browser, so the suite can see which page was opened without
@@ -146,7 +146,6 @@ describe('askForSudoPassword', () => {
   });
 
   it('uses a native URL elicitation when the client does declare one', async () => {
-    const urlCapable = (): ClientCapabilities => ({ elicitation: { url: {} } }) as ClientCapabilities;
     const minted = async (): Promise<string> => 'sealed-state';
 
     const result = await askForSudoPassword(contextWith(undefined), vault(), minted, urlCapable, false, 'vps', 'jonas');
@@ -154,5 +153,63 @@ describe('askForSudoPassword', () => {
     // The multi-round-trip shape, not a relayed link.
     expect('content' in result).toBe(false);
     expect(result).toHaveProperty('requestState', 'sealed-state');
+  });
+});
+
+const urlCapable = (): ClientCapabilities => ({ elicitation: { url: {} } }) as ClientCapabilities;
+
+describe('collectSudoPassword', () => {
+  beforeEach(() => {
+    closeAllPages();
+    openedUrls.length = 0;
+  });
+
+  /** The round that `askForSudoPassword` parked, as the next call would see it. */
+  async function afterAsking(store: Vault): Promise<RoundState> {
+    let round: RoundState | undefined;
+    const minted = async (payload: RoundState): Promise<string> => {
+      round = payload;
+      return 'sealed-state';
+    };
+    await askForSudoPassword(contextWith(undefined), store, minted, urlCapable, false, 'vps', 'jonas');
+    return round!;
+  }
+
+  /** A re-entered round carrying the client's answer to the sudo-password prompt. */
+  function roundWith(state: RoundState, action: 'decline' | 'cancel' | 'accept'): ServerContext {
+    return {
+      mcpReq: {
+        envelope: undefined,
+        requestState: () => state,
+        inputResponses: { 'sudo-password': { action } },
+      },
+    } as unknown as ServerContext;
+  }
+
+  function textOf(result: CallToolResult | undefined): string {
+    return ((result?.content ?? []) as Array<{ text?: string }>).map((block) => block.text).join('');
+  }
+
+  it('opens the page itself when the client declines the prompt without showing it', async () => {
+    const store = vault();
+    const asked = await afterAsking(store);
+
+    const result = await collectSudoPassword(roundWith(asked, 'decline'), store, 'vps', 'jonas', false);
+
+    // A refusal here would leave nothing able to ask for the password at all.
+    const text = textOf(result);
+    expect(text).not.toContain('Declined');
+    expect(text).toMatch(/http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/);
+    expect(text).toContain('dismissed the prompt without showing it');
+  });
+
+  it('reports a decline the user had time to make', async () => {
+    const store = vault();
+    const asked = await afterAsking(store);
+    const readAndRefused: RoundState = { ...asked, askedAt: Date.now() - 30_000 };
+
+    const result = await collectSudoPassword(roundWith(readAndRefused, 'decline'), store, 'vps', 'jonas', false);
+
+    expect(textOf(result)).toContain(`Declined. No sudo password for vps`);
   });
 });
