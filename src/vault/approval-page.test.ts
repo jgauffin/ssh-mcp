@@ -136,6 +136,64 @@ describe('the approval page, when the decision is about a file', () => {
     await expect(ask()).resolves.toEqual({ kind: 'decided', choice: 'apply' });
   });
 
+  /**
+   * What `ssh_put` asks is not a diff and must not pretend to be one. The bytes
+   * are the user's own file, so the decision rests on the four facts in the
+   * detail lines — which local file, where it lands, how big it is, and the
+   * hash that says it is the file they think it is.
+   */
+  it('states the hash and the destination for a put, with no diff at all', async () => {
+    const body = await (
+      await fetch(
+        await linkFrom({
+          key: 'put:lab:/etc/ssl/certs/service.crt:0123456789abcdef:new',
+          title: 'Send this file to lab?',
+          subject: '/etc/ssl/certs/service.crt',
+          diff: undefined,
+          detail: [
+            'host: lab (jonas@10.0.0.4)',
+            'from: /home/jonas/certs/service.crt on this machine',
+            '2048 bytes, sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+            'this file does not exist yet; it will be created with mode 0600',
+          ],
+          choices: [
+            { value: 'deny', label: 'Deny', hint: 'send nothing' },
+            { value: 'send', label: 'Send', hint: 'write this file now' },
+          ],
+        }),
+      )
+    ).text();
+
+    expect(body).toContain('<pre class="subject">/etc/ssl/certs/service.crt</pre>');
+    expect(body).toContain('/home/jonas/certs/service.crt on this machine');
+    expect(body).toContain('sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+    expect(body).toContain('value="send"');
+    expect(body).not.toContain('pre class="diff"');
+  });
+
+  /** Same key design as an edit: these bytes, that destination, nothing else. */
+  it('does not let one approved put stand for different bytes', async () => {
+    const put = {
+      key: 'put:lab:/etc/ssl/certs/service.crt:0123456789abcdef:new',
+      diff: undefined,
+      choices: [
+        { value: 'deny', label: 'Deny' },
+        { value: 'send', label: 'Send' },
+      ],
+    };
+    const first = await linkFrom(put);
+    await fetch(first, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ decision: 'send' }).toString(),
+    });
+
+    const otherBytes = await ask({ ...put, key: 'put:lab:/etc/ssl/certs/service.crt:fedcba9876543210:new' });
+    expect(otherBytes.kind).toBe('pending');
+
+    await expect(ask(put)).resolves.toEqual({ kind: 'decided', choice: 'send' });
+  });
+
   it('keeps the sudo page free of diff markup', async () => {
     const body = await (
       await fetch(

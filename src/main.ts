@@ -8,11 +8,12 @@ import { createRuntime, type Runtime } from './runtime.js';
 import { registerEditTool } from './session/edit.tool.js';
 import { registerFileTools } from './session/files.tool.js';
 import { registerLearnPrompts } from './session/learn.prompt.js';
+import { registerPutTool } from './session/put.tool.js';
 import { registerRunTool } from './session/run.tool.js';
 import { closeAllPages } from './vault/gate.js';
 import { registerVaultTools } from './vault/vault.tool.js';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 /**
  * Nothing may ever be written to stdout except the transport's own frames — a
@@ -38,6 +39,7 @@ function buildServer(runtime: Runtime): McpServer {
   registerRunTool(server, runtime);
   registerFileTools(server, runtime);
   registerEditTool(server, runtime);
+  registerPutTool(server, runtime);
   registerLearnPrompts(server, runtime);
 
   return server;

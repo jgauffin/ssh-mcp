@@ -155,3 +155,4 @@ dist/
 ssh-mcp.toml
 sudo-policy.txt
 audit.jsonl
+.kiwi/

@@ -106,7 +106,7 @@ function textOf(result: unknown): string {
 }
 
 describe('the tool surface', () => {
-  it('offers exactly the eight tools', async () => {
+  it('offers exactly the nine tools', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((tool) => tool.name).sort()).toEqual([
       'ssh_edit',
@@ -114,6 +114,7 @@ describe('the tool surface', () => {
       'ssh_hosts',
       'ssh_lock',
       'ssh_ls',
+      'ssh_put',
       'ssh_run',
       'ssh_status',
       'ssh_sudo',
@@ -121,10 +122,11 @@ describe('the tool surface', () => {
   });
 
   /**
-   * `ssh_edit` replaced `ssh_put`, and the shape is the point: it takes anchors
-   * and not content. A `content` parameter creeping back in would restore the
-   * blind overwrite this tool exists to remove — the model would be handed the
-   * whole file again, and the user a tool name again.
+   * `ssh_edit` replaced an earlier `ssh_put` that took whole file contents, and
+   * the shape is the point: it takes anchors and not content. A `content`
+   * parameter creeping back in would restore the blind overwrite this tool
+   * exists to remove — the model would be handed the whole file again, and the
+   * user a tool name again.
    */
   it('takes anchors rather than file content', async () => {
     const { tools } = await client.listTools();
@@ -139,6 +141,20 @@ describe('the tool surface', () => {
       'old_string',
       'replace_all',
     ]);
+  });
+
+  /**
+   * The same invariant for the tool that got the name back. `ssh_put` takes a
+   * *path on this machine* and never the bytes: the whole reason it exists is
+   * to move a file the model must not hold, so a `content` parameter here would
+   * be the old mistake under the old name.
+   */
+  it('takes a local path rather than file content', async () => {
+    const { tools } = await client.listTools();
+    const put = tools.find((tool) => tool.name === 'ssh_put')!;
+    const schema = put.inputSchema as { properties: Record<string, unknown> };
+
+    expect(Object.keys(schema.properties).sort()).toEqual(['host', 'local_path', 'mode', 'remote_path']);
   });
 
   it('does not lean on the client prompt for sudo consent', async () => {
@@ -240,6 +256,15 @@ describe('locked on every start', () => {
     expect(elicitations[0]!.mode).toBe('url');
   });
 
+  it('gates ssh_put before it reads anything off this machine', async () => {
+    await client.callTool({
+      name: 'ssh_put',
+      arguments: { host: 'lab', local_path: '/tmp/service.crt', remote_path: '/etc/ssl/certs/service.crt' },
+    });
+    expect(elicitations).toHaveLength(1);
+    expect(elicitations[0]!.mode).toBe('url');
+  });
+
   it('answers ssh_hosts without unlocking anything', async () => {
     const result = await client.callTool({ name: 'ssh_hosts', arguments: {} });
     expect(elicitations).toHaveLength(0);
@@ -334,9 +359,9 @@ describe('on a 2025-era connection, which is what Claude Code opens', () => {
     });
   };
 
-  it('serves the same eight tools', async () => {
+  it('serves the same nine tools', async () => {
     const { tools } = await legacy.listTools();
-    expect(tools).toHaveLength(8);
+    expect(tools).toHaveLength(9);
   });
 
   it('relays an unlock link rather than erroring, and the link works', async () => {
@@ -572,6 +597,102 @@ describe('a client that cannot show a native URL prompt', () => {
     expect(await empty.text()).toContain('is required');
     expect((await fetch(url)).status).toBe(200);
   });
+});
+
+/**
+ * `ssh_put` is the only tool that reads this machine's disk, so the refusals
+ * that matter most are the ones that happen before the file is even opened. All
+ * of these run with the vault unlocked: what they observe is the guard, not the
+ * lock, and none of them may reach the network.
+ */
+describe('sending a local file, when the file is one that should not go', () => {
+  let scratch: string;
+
+  beforeEach(async () => {
+    pageBodies = [];
+    answer = submitting({ passphrase: 'test-passphrase' });
+    await client.callTool({ name: 'ssh_run', arguments: { host: 'lab', cmd: 'true' } });
+    elicitations = [];
+    scratch = await mkdtemp(join(tmpdir(), 'ssh-mcp-put-'));
+  });
+
+  const put = async (args: Record<string, unknown>): Promise<string> =>
+    textOf(await client.callTool({ name: 'ssh_put', arguments: { host: 'lab', ...args } }));
+
+  it('refuses a private key by its path, without opening it', async () => {
+    const result = await put({
+      local_path: join(scratch, '.ssh', 'id_ed25519'),
+      remote_path: '/etc/ssl/private/service.key',
+    });
+
+    expect(result).toContain('look like credentials');
+    expect(result).toContain('Nothing was written');
+    // Not "no such file": the path was refused before anything tried to read it.
+    expect(result).not.toContain('no file at');
+    expect(result).not.toMatch(/cannot connect/i);
+    expect(elicitations).toHaveLength(0);
+  });
+
+  it('refuses an executable, whatever mode was asked for', async () => {
+    const binary = join(scratch, 'deploy');
+    await writeFile(binary, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]));
+
+    const result = await put({ local_path: binary, remote_path: '/usr/local/share/deploy', mode: '600' });
+
+    expect(result).toContain('does not put executables');
+    expect(result).toContain('ELF');
+    expect(result).toContain('Nothing was written');
+    expect(result).not.toMatch(/cannot connect/i);
+  });
+
+  it('refuses a mode with an execute bit in it, on content that is plainly not a program', async () => {
+    const cert = join(scratch, 'service.crt');
+    await writeFile(cert, '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', 'utf8');
+
+    const result = await put({ local_path: cert, remote_path: '/etc/ssl/certs/service.crt', mode: '755' });
+
+    expect(result).toContain('does not put executables');
+    expect(result).toContain('0755');
+    expect(result).not.toMatch(/cannot connect/i);
+  });
+
+  it('refuses a shell script even at a mode that cannot run it', async () => {
+    const script = join(scratch, 'migrate.sh');
+    await writeFile(script, '#!/bin/sh\nrm -rf /srv//old\n', 'utf8');
+
+    const result = await put({ local_path: script, remote_path: '/srv/migrate.sh', mode: '600' });
+
+    expect(result).toContain('does not put executables');
+    expect(result).toContain('#!');
+  });
+});
+
+/**
+ * The other half of that guard: a path the user has named in their own config
+ * is sent, and the only thing left to stop it is the approval page. Proven by
+ * how far it gets — all the way to the connection, which these fixtures refuse.
+ */
+describe('sending a local file the config allows', () => {
+  it('gets a credential-shaped path past the guard once it is named in [put].paths', async () => {
+    const scratch = await mkdtemp(join(tmpdir(), 'ssh-mcp-put-'));
+    const pem = join(scratch, 'service.pem');
+    await writeFile(pem, '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n', 'utf8');
+
+    await client.close();
+    client = await start(`${CONFIG}\n[put]\npaths = [${JSON.stringify(pem.replace(/\\/g, '/'))}]\n`);
+    answer = submitting({ passphrase: 'test-passphrase' });
+    await client.callTool({ name: 'ssh_run', arguments: { host: 'lab', cmd: 'true' } });
+
+    const result = textOf(
+      await client.callTool({
+        name: 'ssh_put',
+        arguments: { host: 'lab', local_path: pem, remote_path: '/etc/ssl/certs/service.pem' },
+      }),
+    );
+
+    expect(result).not.toContain('look like credentials');
+    expect(result).toMatch(/cannot connect|ECONNREFUSED|connect/i);
+  }, 20_000);
 });
 
 describe('the sudo gate refuses before it connects', () => {

@@ -273,6 +273,12 @@ page-port = 8765
 # config file does not copy its credentials into the transcript. On by default.
 redact = true
 
+[put]
+# Local files ssh_put may send even though they look like credentials. Anything
+# under ~/.ssh, *.pem, *.key, .env, ~/.aws and the like is refused unless named
+# here. Everything else is sent only after you approve it on a page.
+paths = ["/etc/ssl/local/service.pem"]
+
 # Import connection details from an entry you already have.
 [hosts.prod-1]
 from = "ssh-config:prod-1"    # HostName / User / Port / IdentityFile from ~/.ssh/config
@@ -315,6 +321,12 @@ defeat the point.
 
 See [Editing a file that has a password in it](#editing-a-file-that-has-a-password-in-it)
 for what the model sees, and for what this does not protect you from.
+
+### Put keys
+
+| Key | Meaning |
+| --- | --- |
+| `paths` | Local paths `ssh_put` may send despite looking like credentials. Same glob rules as `[secrets].paths`. It only lifts that built-in refusal; an ordinary file needs no entry, because the approval page stands in front of it. There is no tool parameter for this and the refusals never mention it |
 
 Authentication is **keys only**. No password option, deliberately: a password
 must live somewhere, and every somewhere is worse than an encrypted key file.
@@ -606,6 +618,67 @@ file that is nothing but secret, the honest answer is that the model does not
 read it. `ssh_status` says whether redaction is on, which is how you confirm the
 config took.
 
+### Putting a file on a host without disclosing it
+
+Everything above runs in one direction: the file is already on the host. A
+certificate, a trust store or a licence file on *your* disk had no route at all.
+`ssh_edit` is given content the model wrote, and `ssh_run` cannot write a file,
+so delivering a file the assistant should not read meant doing it by hand.
+
+`ssh_put` names the file instead of carrying it:
+
+```
+you:    put ~/certs/service.crt on prod-1 as /etc/ssl/certs/service.crt
+claude: [ssh_put prod-1 /home/jonas/certs/service.crt → /etc/ssl/certs/service.crt]
+        This would write 2114 bytes to /etc/ssl/certs/service.crt on prod-1, and
+        a page showing where they come from is waiting for the user.
+```
+
+The page is the decision, and it is not a diff — a diff of bytes you already
+have on your own disk would be ceremony. What you cannot otherwise know is which
+local file is leaving, where it lands, and whether it arrives intact, so that is
+what it shows:
+
+```
+Send this file to prod-1?
+/etc/ssl/certs/service.crt
+
+host: prod-1 (deploy@10.0.0.4)
+from: /home/jonas/certs/service.crt on this machine
+2114 bytes, sha256 9f2c…(full digest shown)
+created as deploy if /etc/ssl/certs allows it, otherwise as root with sudo
+this file does not exist yet; it will be created with mode 0600
+```
+
+The reply back to the model is the size, the hash and which user wrote it. The
+bytes went from your disk to the host.
+
+Three things it will not do, each because the alternative is worse:
+
+- **Executables.** No execute bit may be asked for, and content starting with
+  the magic bytes of an ELF, Mach-O, PE, WebAssembly or `#!` file is refused
+  whatever mode is asked for. Either check alone leaks: a file with no `+x`
+  still runs under `sh`, and arbitrary content runs after someone's `chmod`. It
+  also refuses to overwrite a destination that is already executable.
+- **Credential-shaped local paths.** Anything under `~/.ssh`, `*.pem`, `*.key`,
+  `.env`, `~/.aws`, `~/.kube` and a dozen more are refused before the file is
+  opened — because `ssh_put ~/.ssh/id_rsa /tmp/x` followed by `ssh_run cat
+  /tmp/x` is an exfiltration channel, and a page is a thing you answer while
+  thinking about something else. `[put].paths` names the exceptions. Public keys
+  are in that list with the private ones: landing one in `authorized_keys`
+  grants access just as surely.
+- **A file over 256 KiB.** The same cap as everything else here. Larger is a job
+  for `scp`, run by you.
+
+An existing file keeps its owner and mode, because `cp` onto it truncates the
+inode rather than replacing it — the same mechanism `ssh_edit` uses, for the
+same reason. A file that already holds exactly those bytes is reported as such
+and not rewritten, so re-running a finished upload asks you nothing.
+
+An earlier tool of this name took the whole file *as a parameter*. That asked
+the model for everything and you for nothing, and it was removed. The name is
+back because the thing it now does is what the name should always have meant.
+
 ### Tools
 
 | Tool | What it does |
@@ -615,6 +688,7 @@ config took.
 | `ssh_ls` | Lists a directory over SFTP, in `ls -l` form |
 | `ssh_get` | Reads a text file over SFTP (≤ 256 KiB; binary refused), with passwords and keys replaced by markers |
 | `ssh_edit` | Replaces exact snippets of a remote file. Shows you the unified diff on a page and waits for your answer before writing anything, including files owned by root, which it writes through sudo. Puts withheld values back, and can generate or ask for a new one |
+| `ssh_put` | Sends a file from this machine to a host over SFTP. **The contents never enter the conversation**: the model names a local path, and you approve the destination, the size and a SHA-256 on a page. Refuses executables and credential-shaped local paths. A file that already exists keeps its owner and mode |
 | `ssh_hosts` | Lists the aliases you configured. Also published as the `ssh://hosts` resource |
 | `ssh_status` | Locked or unlocked, which sudo grants are live, whether secrets are withheld, where the policy and audit files are |
 | `ssh_lock` | Locks immediately: forgets the keys, closes the connections, revokes session grants |
@@ -667,7 +741,7 @@ src/
   vault/        WHETHER we may act    — lock state, unlock page, MRTR gate, key decoding
   sudo/         WHAT we may do        — parser, matcher, denylist, write guard, grants, the two gates
   secrets/      WHAT may be said      — secret patterns, the withheld-value store
-  session/      HOW we talk           — connection pool, exec, SFTP, anchored edits, diff
+  session/      HOW we talk           — connection pool, exec, SFTP, anchored edits, diff, uploads
   audit/        what happened
   integration/  the same, against a container (npm run test:integration)
 docker/         the throwaway host those tests build

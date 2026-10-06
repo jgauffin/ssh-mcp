@@ -1,0 +1,6 @@
+{
+    "kiwiAgent.permissions.allow": [
+        "Bash(npx vitest:*)",
+        "Bash(docker version:*)"
+    ]
+}

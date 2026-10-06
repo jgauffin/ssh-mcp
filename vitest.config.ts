@@ -7,6 +7,9 @@ import { defineConfig } from 'vitest/config';
  */
 export default defineConfig({
   test: {
-    exclude: ['**/node_modules/**', '**/dist/**', '**/*.integration.test.ts'],
+    // `.kiwi/` holds an agent harness's staged copies of files being edited,
+    // including copies of test files. They resolve no imports and fail on
+    // collection.
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.kiwi/**', '**/*.integration.test.ts'],
   },
 });

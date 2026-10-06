@@ -101,10 +101,10 @@ function whyNotFound(before: string, anchor: string): string | undefined {
  * is a mistake — see {@linkcode Edit}.
  */
 export function applyEdits(before: string, edits: readonly Edit[], exists: boolean): EditOutcome {
-  // `ssh_put` is gone, so this is the only way to create a file. It is kept
-  // deliberately narrow: an empty anchor is a whole-file write, and a whole-file
-  // write to a file that already exists is the blind overwrite this tool exists
-  // to replace.
+  // The only way to create a file whose contents the model authored —
+  // `ssh_put` creates one from a local file instead. Kept deliberately narrow:
+  // an empty anchor is a whole-file write, and a whole-file write to a file
+  // that already exists is the blind overwrite this tool exists to replace.
   const empty = edits.findIndex((edit) => edit.old_string === '');
   if (empty !== -1) {
     if (edits.length > 1) {

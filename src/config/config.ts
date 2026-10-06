@@ -84,6 +84,20 @@ const fileSchema = z
       })
       .strict()
       .optional(),
+    put: z
+      .object({
+        /**
+         * Local paths `ssh_put` may send, on top of the ones it sends anyway.
+         *
+         * Only lifts the built-in refusal of credential-shaped paths; it is not
+         * a general allowlist, because the approval page is what stands in front
+         * of an ordinary file. A lever for whoever edits this file: no tool
+         * parameter reaches it and no refusal mentions it.
+         */
+        paths: z.array(z.string()).optional(),
+      })
+      .strict()
+      .optional(),
     hosts: z.record(z.string(), hostSchema).optional(),
   })
   .strict();
@@ -122,6 +136,11 @@ export interface SecretsConfig {
   readonly paths: readonly string[];
 }
 
+export interface PutConfig {
+  /** Credential-shaped local paths `ssh_put` may nevertheless send. */
+  readonly paths: readonly string[];
+}
+
 export interface Config {
   readonly configPath: string;
   /** Sibling files (sudo-policy.txt, audit.jsonl) live here. */
@@ -134,6 +153,7 @@ export interface Config {
   /** Loopback port for the unlock and approval pages; `0` means a fresh one each run. */
   readonly pagePort: number;
   readonly secrets: SecretsConfig;
+  readonly put: PutConfig;
   readonly hosts: readonly HostConfig[];
 }
 
@@ -184,6 +204,14 @@ patterns = ['(?i)^\\s*ldap_bind_pw\\s*=\\s*(.+)$']
 # Files whose contents are never returned at all, not even redacted. A pattern
 # with no "/" matches the file name wherever it lives.
 paths = ["/etc/app/*.env", "id_rsa"]
+
+[put]
+# ssh_put sends a local file to a host without the model ever seeing its
+# contents, and you approve the destination, size and hash on a page first.
+# Credential-shaped local paths — anything under ~/.ssh, *.pem, *.key, .env,
+# ~/.aws and the like — are refused before that page is drawn. Name one here to
+# allow it, with the same glob rules as above.
+paths = ["/etc/ssl/local/service.pem"]
 
 [hosts.prod-1]
 from = "ssh-config:prod-1"   # import HostName/User/Port/IdentityFile from ~/.ssh/config
@@ -267,6 +295,9 @@ export async function loadConfig(path: string = defaultConfigPath()): Promise<Co
       redact: result.data.secrets?.redact ?? true,
       patterns: result.data.secrets?.patterns ?? [],
       paths: result.data.secrets?.paths ?? [],
+    },
+    put: {
+      paths: result.data.put?.paths ?? [],
     },
     hosts,
   };

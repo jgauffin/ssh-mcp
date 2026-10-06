@@ -9,6 +9,9 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['**/*.integration.test.ts'],
+    // See the note in vitest.config.ts: `.kiwi/` holds an agent harness's
+    // staged copies of files being edited.
+    exclude: ['**/node_modules/**', '**/dist/**', '**/.kiwi/**'],
     testTimeout: 120_000,
     hookTimeout: 600_000,
     fileParallelism: false,

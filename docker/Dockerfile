@@ -51,6 +51,19 @@ RUN mkdir -p /etc/app \
 RUN printf '%s\n' 'SERVICE_TOKEN=tok_live_9f3b21' > /etc/app/prod.env \
  && chmod 0644 /etc/app/prod.env
 
+# Root-owned, with a group and mode no write path would arrive at by accident:
+# `ssh_put` replacing this has to leave all three exactly as they are.
+RUN mkdir -p /etc/app/ssl \
+ && printf '%s\n' '-----BEGIN CERTIFICATE-----' 'old-certificate-body' '-----END CERTIFICATE-----' \
+      > /etc/app/ssl/service.pem \
+ && chown root:adm /etc/app/ssl/service.pem \
+ && chmod 0640 /etc/app/ssl/service.pem
+
+# Executable and root-owned: overwriting this would make whatever was sent a
+# program that runs here, so ssh_put refuses it outright.
+RUN printf '%s\n' '#!/bin/sh' 'echo original hook' > /usr/local/bin/deploy-hook \
+ && chmod 0755 /usr/local/bin/deploy-hook
+
 # Writable by the connecting user, so the unprivileged write path is exercised too.
 RUN printf '%s\n' 'name = local' 'password = user-secret-99' > /home/deploy/user.conf \
  && chown deploy:deploy /home/deploy/user.conf
