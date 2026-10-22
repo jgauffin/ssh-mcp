@@ -11,9 +11,13 @@
   WebAssembly or `#!` content, and no overwriting a destination that already runs.
 - `ssh_put` refuses credential-shaped local paths (`~/.ssh`, `*.pem`, `*.key`, `.env`,
   `~/.aws`) before opening the file. `[put].paths` names exceptions.
+- The sudo approval page colours the command's syntax, and on a line of several commands
+  marks each root command "needs approval" or "already allowed".
 
 ### Fixed
 
+- Two calls needing the same sudo password or passphrase each opened a page, so a second
+  window appeared as the first was submitted. The later call now waits on the open page.
 - A `sudo` hidden inside `$(…)`, `sh -c "…"`, `env`/`xargs`/`timeout` arguments or
   `find -exec` bypassed the gate entirely: no denylist check, no page, nothing in the
   audit log. Both tools now refuse such a line and say where the sudo is.

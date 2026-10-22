@@ -256,10 +256,12 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
           approve: async (eligibility) => {
             // What a person actually decides on: which commands run as root, and
             // how much else is riding along on the same line. The segments that
-            // use sudo are named one by one; the rest are counted, because a
-            // reader who wants them verbatim has the whole line above.
+            // use sudo are named one by one, marked by whether a rule already
+            // allows them; the rest are counted, because a reader who wants them
+            // verbatim has the whole line above.
             const privileged = new Set(eligibility.invocations.map((invocation) => invocation.segment));
             const rest = eligibility.segments.filter((segment) => !privileged.has(segment)).length;
+            const allowed = new Set(eligibility.alreadyAllowed);
 
             const outcome = await askForApproval({
               // Keyed by host and command, so two different commands cannot
@@ -271,15 +273,23 @@ export function registerRunTool(server: McpServer, runtime: Runtime): void {
               // The expanded line, so the value the model never saw is read by
               // the one person who should see it before it runs.
               subject: real,
+              subjectIsCommandLine: true,
               detail: [
                 `host: ${alias} (${host.user}@${host.host})`,
                 ...(carriesSecret ? ['a value withheld from the model has been put into this line'] : []),
-                ...eligibility.invocations.map((invocation) => `as root: ${invocation.segment.text}`),
                 ...(rest > 0
                   ? [`also: ${rest} other command${rest === 1 ? '' : 's'} on the same line, as ${host.user}`]
                   : []),
                 ...(eligibility.notGrantableBecause ? [`cannot be remembered: ${eligibility.notGrantableBecause}`] : []),
               ],
+              // A one-command line would only repeat the subject.
+              rootCommands:
+                eligibility.segments.length > 1
+                  ? eligibility.invocations.map((invocation) => ({
+                      text: invocation.segment.text,
+                      alreadyAllowed: allowed.has(invocation),
+                    }))
+                  : [],
               choices: [
                 { value: 'deny', label: 'Deny', hint: 'run nothing' },
                 { value: 'once', label: 'Allow once', hint: 'this command, right now' },

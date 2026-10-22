@@ -18,6 +18,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'main.js');
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'vault', 'fixtures');
 
+/** A page's text as the reader sees it, without the colouring spans. */
+const visibleText = (html: string): string => html.replace(/<[^>]*>/g, '');
+
+/** The rows of the "runs as root" list, badge and command, in order. */
+const rootRows = (html: string): string[] =>
+  [...html.matchAll(/<li class="(?:asks|allowed)">(.*?)<\/li>/g)].map((row) =>
+    visibleText(row[1]!.replace('</span><code>', ' ')),
+  );
+
 type ElicitRequest = { mode?: string; message: string; url?: string; requestedSchema?: Record<string, unknown> };
 type ElicitAnswer = { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> };
 
@@ -805,7 +814,9 @@ describe('the sudo gate refuses before it connects', () => {
 
     const page = await (await fetch(url)).text();
     // The point of the whole exercise: the command is on the page.
-    expect(page).toContain('sudo apt update');
+    expect(visibleText(page)).toContain('sudo apt update');
+    // Once, not again in a list of the line's commands.
+    expect(rootRows(page)).toEqual([]);
     expect(page).toContain('Run this with sudo on lab?');
     expect(page).toContain('value="deny"');
     expect(page).toContain('value="once"');
@@ -824,16 +835,40 @@ describe('the sudo gate refuses before it connects', () => {
     const url = /http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/.exec(result)![0];
 
     const page = await (await fetch(url)).text();
-    expect(page).toContain('sudo apt update; whoami; sudo systemctl restart nginx');
+    expect(visibleText(page)).toContain('sudo apt update; whoami; sudo systemctl restart nginx');
     // Every privileged segment by name, and the rest counted rather than dumped.
-    expect(page).toContain('as root: sudo apt update');
-    expect(page).toContain('as root: sudo systemctl restart nginx');
+    expect(rootRows(page)).toEqual([
+      'needs approval sudo apt update',
+      'needs approval sudo systemctl restart nginx',
+    ]);
     expect(page).toContain('also: 1 other command on the same line, as root');
     // Prose, not a pile of separators.
     expect(page).toContain('cannot be remembered: it runs 3 commands, not one');
     expect(page).not.toContain('shell extras');
     // With nothing safe to store, "for this session" is not offered at all.
     expect(page).not.toContain('value="session"');
+  });
+
+  it('marks_which_root_commands_on_the_line_are_already_allowed_and_which_need_approval', async () => {
+    const first = textOf(await client.callTool({ name: 'ssh_sudo', arguments: { host: 'lab', cmd: 'sudo apt update' } }));
+    await fetch(/http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/.exec(first)![0], {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'decision=session',
+    });
+    // The parked answer is taken, and the grant made, by the rerun.
+    await client.callTool({ name: 'ssh_sudo', arguments: { host: 'lab', cmd: 'sudo apt update' } });
+
+    const result = textOf(
+      await client.callTool({
+        name: 'ssh_sudo',
+        arguments: { host: 'lab', cmd: 'sudo apt update && sudo systemctl restart nginx' },
+      }),
+    );
+    const url = /http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/.exec(result)![0];
+
+    const page = await (await fetch(url)).text();
+    expect(rootRows(page)).toEqual(['already allowed sudo apt update', 'needs approval sudo systemctl restart nginx']);
   });
 
   it('refuses to run when the user denies on the page', async () => {

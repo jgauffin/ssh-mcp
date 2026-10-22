@@ -9,7 +9,13 @@ import {
   type ServerContext,
 } from '@modelcontextprotocol/server';
 import { openInBrowser } from './open-browser.js';
-import { openUnlockPage, type SecretField, type UnlockPage, type UnlockPageOptions } from './unlock-page.js';
+import {
+  openUnlockPage,
+  type RootCommand,
+  type SecretField,
+  type UnlockPage,
+  type UnlockPageOptions,
+} from './unlock-page.js';
 import type { Vault } from './vault.js';
 
 /**
@@ -246,9 +252,11 @@ export async function askForApproval(options: {
   readonly key: string;
   readonly title: string;
   readonly subject: string;
+  readonly subjectIsCommandLine?: boolean;
   /** A unified diff to show under the subject, when the decision is about a file. */
   readonly diff?: string;
   readonly detail: readonly string[];
+  readonly rootCommands?: readonly RootCommand[];
   readonly choices: readonly ApprovalChoice[];
   readonly openBrowser: boolean;
 }): Promise<ApprovalOutcome> {
@@ -268,6 +276,8 @@ export async function askForApproval(options: {
       // Conditional rather than `diff: options.diff`: `exactOptionalPropertyTypes`
       // makes a present-but-undefined property a different thing from an absent one.
       ...(options.diff === undefined ? {} : { diff: options.diff }),
+      ...(options.rootCommands === undefined ? {} : { rootCommands: options.rootCommands }),
+      ...(options.subjectIsCommandLine === undefined ? {} : { subjectIsCommandLine: options.subjectIsCommandLine }),
     },
     async (values) => {
       decisions.set(options.key, { choice: values.get('decision')!, at: Date.now() });
@@ -355,10 +365,31 @@ function collect(id: string | undefined): UnlockPage | undefined {
   return page;
 }
 
+/**
+ * Pages handed to the client for a secret and not yet answered, by the secret.
+ *
+ * One secret, one page. Two calls wanting the same password — the model running
+ * two commands on a host at once, or asking again before the first page was
+ * answered — each opened their own, and the client put the second in a new
+ * window just as the user pressed Enter on the first. A later call waits on the
+ * page already open instead.
+ *
+ * Held as the promise of the page, so it is registered before the listener is
+ * bound and a call arriving in between still finds it.
+ */
+const askedPages = new Map<string, Promise<UnlockPage>>();
+
+/** Waits for the user to answer a page another call already put in front of them. */
+async function answerOn(asked: Promise<UnlockPage>): Promise<{ accepted: boolean; url: string }> {
+  const page = await asked;
+  return { accepted: (await settledWithin(page.accepted, WAIT_FOR_SUBMIT_MS)) ?? false, url: page.url };
+}
+
 /** Abandons every open page — used when the vault relocks or the process exits. */
 export function closeAllPages(): void {
   for (const page of pendingPages.values()) page.close();
   pendingPages.clear();
+  askedPages.clear();
   closeManualPages();
   // Relocking revokes approvals, so an unconsumed decision must not outlive it.
   decisions.clear();
@@ -398,6 +429,9 @@ async function unlockWith(vault: Vault, values: Map<string, string>): Promise<st
 
 interface SecretRoundOptions {
   readonly key: string;
+  /** Which secret this is, so a second call for it waits on this page. See {@linkcode askedPages}. */
+  readonly page: string;
+  readonly signal: AbortSignal;
   readonly message: string;
   readonly title: string;
   readonly detail: readonly string[];
@@ -407,13 +441,29 @@ interface SecretRoundOptions {
 
 /** Opens a fresh page and returns the input-required round that points the user at it. */
 async function askForSecret(options: SecretRoundOptions, mintState: MintState): Promise<InputRequiredResult> {
-  const page = await openUnlockPage({
+  const opening = openUnlockPage({
     title: options.title,
     detail: options.detail,
     fields: options.fields,
     timeoutMs: PAGE_TIMEOUT_MS,
     onSubmit: options.onSubmit,
   });
+  askedPages.set(options.page, opening);
+  let page: UnlockPage;
+  try {
+    page = await opening;
+  } catch (cause) {
+    askedPages.delete(options.page);
+    throw cause;
+  }
+  void page.accepted.then(() => {
+    if (askedPages.get(options.page) === opening) askedPages.delete(options.page);
+  });
+  // A call the client gave up on leaves its page with nobody coming back for
+  // it, and possibly never shown. Closed, so the next call asks afresh rather
+  // than waiting on a page the user cannot see.
+  options.signal.addEventListener('abort', () => page.close(), { once: true });
+
   const pageId = park(page);
   return inputRequired({
     inputRequests: {
@@ -510,11 +560,23 @@ export async function ensureUnlocked(
     return { ready: true };
   }
 
+  const open = askedPages.get('unlock');
+  if (open) {
+    const { accepted, url } = await answerOn(open);
+    if (accepted) {
+      vault.touch();
+      return { ready: true };
+    }
+    return { ready: false, result: textResult(relayed('ssh-mcp is locked.', url, true), true) };
+  }
+
   return {
     ready: false,
     result: await askForSecret(
       {
         key: 'unlock',
+        page: 'unlock',
+        signal: ctx.mcpReq.signal,
         message: 'ssh-mcp is locked. Open this page to enter your key passphrase — it is never sent to the model.',
         ...unlockForm(hostAliases),
         onSubmit: (values) => unlockWith(vault, values),
@@ -642,9 +704,17 @@ export async function askForSudoPassword(
     );
   }
 
+  const open = askedPages.get(`sudo:${alias}`);
+  if (open) {
+    const { accepted, url } = await answerOn(open);
+    return accepted ? undefined : textResult(relayed(`${alias} asks for a password before it will run sudo.`, url, true), true);
+  }
+
   return askForSecret(
     {
       key: 'sudo-password',
+      page: `sudo:${alias}`,
+      signal: ctx.mcpReq.signal,
       message: `${alias} asks for a password before running sudo. Open this page to enter it — it is never sent to the model.`,
       ...sudoPasswordForm(alias, user),
       onSubmit: storeSudoPassword(vault, alias),

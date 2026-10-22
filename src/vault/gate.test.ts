@@ -28,8 +28,13 @@ vi.mock('./open-browser.js', () => ({
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 
 /** The minimum of a request context these functions actually read. */
-function contextWith(envelope: Record<string, unknown> | undefined): ServerContext {
-  return { mcpReq: { envelope } } as unknown as ServerContext;
+function contextWith(envelope: Record<string, unknown> | undefined, signal = new AbortController().signal): ServerContext {
+  return { mcpReq: { envelope, signal } } as unknown as ServerContext;
+}
+
+/** The page link inside a relayed message or an input-required round. */
+function linkIn(result: unknown): string {
+  return /http:\/\/127\.0\.0\.1:\d+\/unlock\/[\w-]+/.exec(JSON.stringify(result))![0];
 }
 
 const neverMinted = async (): Promise<string> => {
@@ -153,6 +158,44 @@ describe('askForSudoPassword', () => {
     // The multi-round-trip shape, not a relayed link.
     expect('content' in result).toBe(false);
     expect(result).toHaveProperty('requestState', 'sealed-state');
+  });
+
+  /**
+   * Two commands on one host at once both meet sudo's refusal. Each used to
+   * hand the client a page of its own, and the second arrived as a new window
+   * the moment the user submitted the first.
+   */
+  it('waits on the page already asking for this password instead of opening another', async () => {
+    const store = vault();
+    const minted = async (): Promise<string> => 'sealed-state';
+    const first = await askForSudoPassword(contextWith(undefined), store, minted, urlCapable, false, 'vps', 'jonas');
+
+    const second = askForSudoPassword(contextWith(undefined), store, minted, urlCapable, false, 'vps', 'jonas');
+    await fetch(linkIn(first), {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ 'sudo-password': 'hunter2' }).toString(),
+    });
+
+    // Answered by the first page: no round of its own, so nothing new to open.
+    await expect(second).resolves.toBeUndefined();
+    expect(store.sudoPasswordFor('vps')?.toString()).toBe('hunter2');
+  }, 20_000);
+
+  it('asks afresh once the client gives up on the call that opened the page', async () => {
+    const minted = async (): Promise<string> => 'sealed-state';
+    const abandoned = new AbortController();
+    const first = await askForSudoPassword(contextWith(undefined, abandoned.signal), vault(), minted, urlCapable, false, 'vps', 'jonas');
+
+    abandoned.abort();
+    // The abandoned page may never have been shown, so waiting on it would be
+    // waiting on nothing. Its link is dead, and the next call gets a page of its own.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect((await fetch(linkIn(first))).status).toBe(404);
+
+    const second = await askForSudoPassword(contextWith(undefined), vault(), minted, urlCapable, false, 'vps', 'jonas');
+    expect(second).toHaveProperty('requestState', 'sealed-state');
+    expect(linkIn(second)).not.toBe(linkIn(first));
   });
 });
 

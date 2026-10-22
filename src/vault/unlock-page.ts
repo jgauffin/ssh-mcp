@@ -2,6 +2,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { DEFAULT_PAGE_PORT } from '../config/config.js';
+import { shellTokens } from './shell-highlight.js';
 
 /**
  * A single-use page on 127.0.0.1 for asking the user something directly.
@@ -46,16 +47,26 @@ export interface ChoiceField {
   readonly value?: string;
 }
 
+/** A command that will run as root, and whether this answer is what lets it. */
+export interface RootCommand {
+  readonly text: string;
+  readonly alreadyAllowed: boolean;
+}
+
 export interface UnlockPageOptions {
   readonly title: string;
   /** Lines describing exactly what is at stake, shown above the form. */
   readonly detail: readonly string[];
+  /** The commands that will run as root, each marked as needing approval or already allowed. */
+  readonly rootCommands?: readonly RootCommand[];
   readonly fields: readonly SecretField[];
   readonly choices?: readonly ChoiceField[];
   /** Text on the submit button. Defaults to "Unlock". */
   readonly submitLabel?: string;
   /** Shown fixed-width above the form — the command, or the path, being approved. */
   readonly subject?: string;
+  /** The subject is a shell line, and is shown syntax-coloured. */
+  readonly subjectIsCommandLine?: boolean;
   /**
    * A unified diff, rendered below the subject with `+`/`-` lines coloured.
    *
@@ -93,6 +104,15 @@ function escapeHtml(value: string): string {
   );
 }
 
+/** Every byte still goes through escapeHtml; only the class comes from the tokenizer's closed set. */
+function highlightShell(line: string): string {
+  return shellTokens(line)
+    .map((token) =>
+      token.kind === 'text' ? escapeHtml(token.text) : `<span class="sh-${token.kind}">${escapeHtml(token.text)}</span>`,
+    )
+    .join('');
+}
+
 function formPage(options: UnlockPageOptions, path: string, error?: string): string {
   const detail = options.detail.map((line) => `<li>${escapeHtml(line)}</li>`).join('');
   const banner = error ? `<p class="error">${escapeHtml(error)}</p>` : '';
@@ -107,7 +127,11 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
 
   // The command being approved, verbatim and unmissable. This is the whole
   // reason the approval moved onto a page.
-  const subject = options.subject ? `<pre class="subject">${escapeHtml(options.subject)}</pre>` : '';
+  const subject = options.subject
+    ? `<pre class="subject">${
+        options.subjectIsCommandLine ? highlightShell(options.subject) : escapeHtml(options.subject)
+      }</pre>`
+    : '';
 
   // The change being approved, line by line. Only the class name is chosen by
   // the server, and only from a closed set; every byte of the line itself still
@@ -129,6 +153,19 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
   // Joined with nothing, not with a newline: the spans are display:block inside
   // a pre, so a newline between them would double-space the whole diff.
   const diff = options.diff ? `<pre class="diff">${options.diff.split('\n').map(diffLine).join('')}</pre>` : '';
+
+  // Marked by word as well as colour, so the distinction survives a colour-blind
+  // reader and a page saved as text.
+  const rootCommands =
+    options.rootCommands && options.rootCommands.length > 0
+      ? `<h2>Runs as root</h2><ul class="root">${options.rootCommands
+          .map((command) =>
+            command.alreadyAllowed
+              ? `<li class="allowed"><span class="badge">already allowed</span><code>${highlightShell(command.text)}</code></li>`
+              : `<li class="asks"><span class="badge">needs approval</span><code>${highlightShell(command.text)}</code></li>`,
+          )
+          .join('')}</ul>`
+      : '';
 
   const choices = (options.choices ?? [])
     .map(
@@ -156,10 +193,18 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
 <meta name="referrer" content="no-referrer">
 <title>${escapeHtml(options.title)}</title>
 <style>
-  :root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --card:#fff; --line:#dcdcdc; --muted:#555; --accent:#2f6f4f; }
+  :root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --card:#fff; --line:#dcdcdc; --muted:#555; --accent:#2f6f4f;
+          --sh-sudo:#b4541a; --sh-command:#2f6f4f; --sh-flag:#7a4e8c; --sh-string:#8a6d12; --sh-operator:#b03a48; --sh-variable:#6b5d2f; }
   @media (prefers-color-scheme: dark) {
-    :root { --fg:#e8e8e8; --bg:#161616; --card:#1f1f1f; --line:#333; --muted:#aaa; --accent:#4f9d75; }
+    :root { --fg:#e8e8e8; --bg:#161616; --card:#1f1f1f; --line:#333; --muted:#aaa; --accent:#4f9d75;
+            --sh-sudo:#f0a35e; --sh-command:#7fcf9f; --sh-flag:#c9a0dc; --sh-string:#e3c46f; --sh-operator:#ef7b88; --sh-variable:#d8b98a; }
   }
+  .sh-sudo { color:var(--sh-sudo); font-weight:700; }
+  .sh-command { color:var(--sh-command); font-weight:700; }
+  .sh-flag { color:var(--sh-flag); }
+  .sh-string { color:var(--sh-string); }
+  .sh-operator { color:var(--sh-operator); font-weight:700; }
+  .sh-variable { color:var(--sh-variable); font-style:italic; }
   * { box-sizing: border-box; }
   body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
          font:15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; padding:2rem 1rem; }
@@ -195,6 +240,17 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
   pre.diff .del { background:color-mix(in srgb, #c0392b 16%, transparent); }
   pre.diff .hunk { color:var(--muted); background:color-mix(in srgb, var(--fg) 7%, transparent); }
   pre.diff .meta { color:var(--muted); }
+  h2 { margin:0 0 .4rem; font-size:.85rem; font-weight:600; }
+  ul.root { list-style:none; padding:0; color:var(--fg); font-size:.875rem; }
+  ul.root li { display:flex; gap:.6rem; align-items:baseline; margin:0 0 .35rem; padding:.45rem .6rem;
+               border:1px solid var(--line); border-left-width:4px; border-radius:6px; }
+  ul.root code { font:13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap:anywhere; }
+  ul.root .badge { flex:none; padding:.05rem .45rem; border-radius:999px; font:600 .72rem/1.5 ui-sans-serif, system-ui, sans-serif;
+                   text-transform:uppercase; letter-spacing:.03em; white-space:nowrap; }
+  ul.root li.asks { border-left-color:#d08a1c; background:color-mix(in srgb, #d08a1c 10%, transparent); }
+  ul.root li.asks .badge { background:#d08a1c; color:#1a1200; }
+  ul.root li.allowed { border-left-color:var(--accent); color:var(--muted); }
+  ul.root li.allowed .badge { background:color-mix(in srgb, var(--accent) 25%, transparent); color:var(--fg); }
 </style></head>
 <body><main${options.diff ? ' class="wide"' : ''}>
   <h1>${escapeHtml(options.title)}</h1>
@@ -202,6 +258,7 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
   ${banner}
   ${subject}
   ${diff}
+  ${rootCommands}
   <ul>${detail}</ul>
   <form method="post" action="${path}">${inputs}${choices}
     <button type="submit">${escapeHtml(options.submitLabel ?? 'Unlock')}</button>

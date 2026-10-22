@@ -328,6 +328,15 @@ export function gateUnprivileged(options: SudoGateOptions): SudoGate {
 
 export type SudoApproval = 'deny' | 'once' | 'session';
 
+/** What the approval page is asked to decide on. */
+export interface ApprovalRequest extends Eligibility {
+  /**
+   * The sudo invocations a stored rule already covers. The line is still asked
+   * about as a whole, but the reader should see which part is actually new.
+   */
+  readonly alreadyAllowed: readonly SudoInvocation[];
+}
+
 /**
  * The `ssh_sudo` gate.
  *
@@ -338,7 +347,7 @@ export type SudoApproval = 'deny' | 'once' | 'session';
 export async function gatePrivileged(
   options: SudoGateOptions & {
     /** Shows the command to the user and returns what they chose. */
-    readonly approve: (eligibility: Eligibility) => Promise<SudoApproval | { readonly pending: CallToolResult }>;
+    readonly approve: (request: ApprovalRequest) => Promise<SudoApproval | { readonly pending: CallToolResult }>;
   },
 ): Promise<SudoGate> {
   const eligibility = assess(options.command);
@@ -365,18 +374,22 @@ export async function gatePrivileged(
     return { allowed: true, invocations };
   }
 
-  if (coverable && options.carriesSecret !== true) {
-    // Every sudo on the line, not just the first: a pipeline runs as many
-    // privileged commands as it names, and one uncovered segment is an
-    // uncovered line.
-    const covering = invocations.map((invocation) => options.grants.find(options.alias, invocation.argv));
-    if (covering.every((grant) => grant !== undefined)) {
-      options.record('allowed', covering.map((grant) => `grant ${grant.host} ${formatPattern(grant.pattern)}`).join('; '));
-      return { allowed: true, invocations };
-    }
+  // Every sudo on the line, not just the first: a pipeline runs as many
+  // privileged commands as it names, and one uncovered segment is an
+  // uncovered line.
+  const covering =
+    coverable && options.carriesSecret !== true
+      ? invocations.map((invocation) => options.grants.find(options.alias, invocation.argv))
+      : [];
+  if (covering.length > 0 && covering.every((grant) => grant !== undefined)) {
+    options.record('allowed', covering.map((grant) => `grant ${grant.host} ${formatPattern(grant.pattern)}`).join('; '));
+    return { allowed: true, invocations };
   }
 
-  const decision = await options.approve(eligibility);
+  const decision = await options.approve({
+    ...eligibility,
+    alreadyAllowed: invocations.filter((_, index) => covering[index] !== undefined),
+  });
   if (typeof decision !== 'string') {
     options.record('asked', 'waiting for approval');
     return { allowed: false, result: decision.pending };
