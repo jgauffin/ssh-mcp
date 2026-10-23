@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askForApproval, closeAllPages } from './gate.js';
+import { setClientName } from './unlock-page.js';
 
 // Stands in for the browser, so the suite can see what was put in front of the
 // user without windows appearing on whoever is running it.
@@ -209,6 +210,36 @@ describe('the approval page, when the decision is about a file', () => {
     expect(body).toContain('<pre class="subject">sudo systemctl restart nginx</pre>');
     expect(body).not.toContain('pre class="diff"');
     expect(body).not.toContain('<main class="wide">');
+  });
+});
+
+/** Not every client is Claude Code, so the page names the one that asked. */
+describe('the page shown once an answer is accepted', () => {
+  beforeEach(() => {
+    closeAllPages();
+    setClientName(() => undefined);
+  });
+
+  const submit = async (): Promise<string> => {
+    const response = await fetch(await linkFrom(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ decision: 'apply' }).toString(),
+    });
+    return response.text();
+  };
+
+  it('names the client from the handshake, escaped', async () => {
+    setClientName(() => 'Open<Code>');
+    expect(await submit()).toContain('return to Open&lt;Code&gt;.');
+  });
+
+  it('falls back to a neutral name when the client gave none', async () => {
+    expect(await submit()).toContain('return to your MCP client.');
+  });
+
+  it('offers a close button', async () => {
+    expect(await submit()).toContain('Close this tab</button>');
   });
 });
 

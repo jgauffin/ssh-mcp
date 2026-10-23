@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { McpServer } from '@modelcontextprotocol/server';
+import { getDisplayName, McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { ConfigError } from './config/config.js';
 import { registerHostTools } from './hosts/hosts.tool.js';
@@ -11,6 +11,7 @@ import { registerLearnPrompts } from './session/learn.prompt.js';
 import { registerPutTool } from './session/put.tool.js';
 import { registerRunTool } from './session/run.tool.js';
 import { closeAllPages } from './vault/gate.js';
+import { setClientName } from './vault/unlock-page.js';
 import { registerVaultTools } from './vault/vault.tool.js';
 
 const VERSION = '0.2.0';
@@ -33,6 +34,13 @@ function buildServer(runtime: Runtime): McpServer {
       requestState: { verify: runtime.requestStateCodec.verify },
     },
   );
+
+  // The deprecated accessor, because the page is finished outside any request
+  // and so has no context to read from. It is backfilled on 2026-07-28 too.
+  setClientName(() => {
+    const client = server.server.getClientVersion();
+    return client && getDisplayName(client);
+  });
 
   registerHostTools(server, runtime);
   registerVaultTools(server, runtime);

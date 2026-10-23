@@ -9,6 +9,7 @@ import { SecretStore } from './secrets/store.js';
 import { ConnectionPool } from './session/pool.js';
 import { SudoGrants } from './sudo/grants.js';
 import { closeAllPages, type RoundState } from './vault/gate.js';
+import { setBrowser } from './vault/open-browser.js';
 import { setPagePort } from './vault/unlock-page.js';
 import { Vault } from './vault/vault.js';
 
@@ -34,6 +35,12 @@ export interface Runtime {
   readonly requestStateCodec: RequestStateCodec<RoundState>;
 }
 
+/** This machine, by name or address. */
+export function isLoopback(host: string): boolean {
+  const bare = host.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
+  return bare === 'localhost' || bare === '::1' || /^127(\.\d{1,3}){3}$/.test(bare);
+}
+
 export async function createRuntime(configPath?: string): Promise<Runtime> {
   const config = await loadConfig(configPath);
   const hosts = await HostRegistry.load(config);
@@ -41,10 +48,14 @@ export async function createRuntime(configPath?: string): Promise<Runtime> {
   // Before anything can open a page: the first one to open binds the port, and
   // from then on this has no say.
   setPagePort(config.pagePort);
+  setBrowser(config.browser);
 
   const vault = new Vault(
     hosts.all().map((host) => host.keyPath),
     config.idleTimeoutMs,
+    // The vault opens every key at once, so skipping the click for one loopback
+    // host would open the keys for remote ones too. Hence all, not any.
+    config.confirmUnencrypted ?? !hosts.all().every((host) => isLoopback(host.host)),
   );
   const pool = new ConnectionPool(vault);
   const grants = new SudoGrants(join(config.configDir, 'sudo-policy.txt'));

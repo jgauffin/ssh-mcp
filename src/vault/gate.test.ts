@@ -2,7 +2,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { CallToolResult, ClientCapabilities, ServerContext } from '@modelcontextprotocol/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { askForSudoPassword, closeAllPages, collectSudoPassword, type RoundState } from './gate.js';
+import { askForSudoPassword, closeAllPages, collectSudoPassword, ensureUnlocked, type RoundState } from './gate.js';
 import { Vault } from './vault.js';
 
 // Stands in for the browser, so the suite can see which page was opened without
@@ -44,6 +44,71 @@ const neverMinted = async (): Promise<string> => {
 function vault(): Vault {
   return new Vault([join(FIXTURES, 'id_ed25519')], 60_000);
 }
+
+describe('ensureUnlocked', () => {
+  const formOnly = (): ClientCapabilities => ({ elicitation: { form: {} } }) as ClientCapabilities;
+  const textOf = (result: CallToolResult): string => result.content.map((block) => ('text' in block ? block.text : '')).join('');
+
+  beforeEach(() => {
+    closeAllPages();
+    openedUrls.length = 0;
+  });
+
+  it('asks for consent, with nothing to type, when no key is encrypted', async () => {
+    const store = new Vault([join(FIXTURES, 'id_ed25519_plain')], 60_000);
+    const gate = await ensureUnlocked(contextWith(undefined), store, neverMinted, ['vps'], formOnly, false);
+
+    expect(gate.ready).toBe(false);
+    expect(store.locked).toBe(true);
+    const url = linkIn((gate as { result: unknown }).result);
+    const body = await (await fetch(url)).text();
+    expect(body).toContain('nothing to type');
+    expect(body).not.toContain('type="password"');
+
+    await fetch(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: '' });
+    expect(store.locked).toBe(false);
+  });
+
+  it('opens with no page when no key is encrypted and the click is waived', async () => {
+    const store = new Vault([join(FIXTURES, 'id_ed25519_plain')], 60_000, false);
+    const gate = await ensureUnlocked(contextWith(undefined), store, neverMinted, ['vps'], formOnly, false);
+
+    expect(gate.ready).toBe(true);
+    expect(store.locked).toBe(false);
+  });
+
+  it('still asks for the passphrase when the click is waived', async () => {
+    const store = new Vault([join(FIXTURES, 'id_ed25519_plain'), join(FIXTURES, 'id_ed25519')], 60_000, false);
+    const gate = await ensureUnlocked(contextWith(undefined), store, neverMinted, ['vps'], formOnly, false);
+
+    expect(gate.ready).toBe(false);
+    const body = await (await fetch(linkIn((gate as { result: unknown }).result))).text();
+    expect(body).toContain('type="password"');
+  });
+
+  it.each([
+    ['an encrypted key', ['id_ed25519']],
+    ['encrypted and unencrypted keys', ['id_ed25519_plain', 'id_ed25519']],
+  ])('asks for the passphrase on a page given %s', async (_, names) => {
+    const store = new Vault(names.map((name) => join(FIXTURES, name)), 60_000);
+    const gate = await ensureUnlocked(contextWith(undefined), store, neverMinted, ['vps'], formOnly, false);
+
+    expect(gate.ready).toBe(false);
+    const body = await (await fetch(linkIn((gate as { result: unknown }).result))).text();
+    expect(body).toContain('type="password"');
+    expect(store.locked).toBe(true);
+  });
+
+  it('reports a key that cannot be read instead of asking for a passphrase', async () => {
+    const store = new Vault([join(FIXTURES, 'nope')], 60_000);
+    const gate = await ensureUnlocked(contextWith(undefined), store, neverMinted, ['vps'], formOnly, false);
+
+    expect(gate.ready).toBe(false);
+    const text = textOf((gate as { result: CallToolResult }).result);
+    expect(text).toContain('cannot read key file');
+    expect(text).not.toMatch(/\/unlock\//);
+  });
+});
 
 describe('askForSudoPassword', () => {
   const formOnly = (): ClientCapabilities => ({ elicitation: { form: {} } }) as ClientCapabilities;

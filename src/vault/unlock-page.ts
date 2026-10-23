@@ -271,11 +271,34 @@ function formPage(options: UnlockPageOptions, path: string, error?: string): str
 </main></body></html>`;
 }
 
-const DONE_PAGE = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Unlocked</title>
+let clientName: () => string | undefined = () => undefined;
+
+/**
+ * Names the client on the "Done" page, so it says where to go back to.
+ *
+ * A provider rather than a value: the name arrives with `initialize`, after the
+ * runtime is built, and on 2026-07-28 with each request.
+ */
+export function setClientName(provider: () => string | undefined): void {
+  clientName = provider;
+}
+
+/**
+ * The close button is a convenience, not a promise. Browsers refuse
+ * `window.close()` on a tab a script did not open — which is every tab opened
+ * from the command line — so when the tab survives it says how to close it.
+ */
+function donePage(): string {
+  const client = escapeHtml(clientName() ?? 'your MCP client');
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Done</title>
 <style>:root{color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center;
-font:15px/1.5 ui-sans-serif,system-ui,sans-serif}p{color:#666}</style></head>
-<body><div><h1>Done</h1><p>You can close this tab and return to Claude Code.</p></div></body></html>`;
+font:15px/1.5 ui-sans-serif,system-ui,sans-serif}p{color:#666}
+button{padding:.5rem 1rem;font:600 .95rem/1.5 inherit;border:0;border-radius:6px;background:#2f6f4f;color:#fff;cursor:pointer}</style></head>
+<body><div><h1>Done</h1><p>You can close this tab and return to ${client}.</p>
+<button type="button" onclick="window.close();this.hidden=true;this.nextElementSibling.hidden=false">Close this tab</button>
+<p hidden>Your browser keeps this tab open. Close it with Ctrl+W, or ⌘W on a Mac.</p></div></body></html>`;
+}
 
 function safeEqual(a: string, b: string): boolean {
   const left = Buffer.from(a, 'utf8');
@@ -476,7 +499,7 @@ export async function openUnlockPage(options: UnlockPageOptions): Promise<Unlock
     }
 
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
-    res.end(DONE_PAGE, () => shutdown(true));
+    res.end(donePage(), () => shutdown(true));
   });
 
   let port: number;

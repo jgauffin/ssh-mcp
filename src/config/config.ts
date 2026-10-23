@@ -53,6 +53,11 @@ const fileSchema = z
     vault: z
       .object({
         'idle-timeout': durationMs.optional(),
+        /**
+         * Ask before unlocking keys that have no passphrase. A passphrase always
+         * asks. Defaults to false when every host is loopback, true otherwise.
+         */
+        'confirm-unencrypted': z.boolean().optional(),
       })
       .strict()
       .optional(),
@@ -62,6 +67,11 @@ const fileSchema = z
         'confirm-every-command': z.boolean().optional(),
         /** Open the unlock page in the default browser instead of only printing its link. */
         'open-browser': z.boolean().optional(),
+        /**
+         * The browser `open-browser` uses instead of the system default, e.g.
+         * "Google Chrome" on macOS, "chrome" on Windows, "firefox" on Linux.
+         */
+        browser: z.string().trim().min(1).optional(),
         /**
          * The loopback port the unlock and approval pages are served on.
          *
@@ -146,10 +156,17 @@ export interface Config {
   /** Sibling files (sudo-policy.txt, audit.jsonl) live here. */
   readonly configDir: string;
   readonly idleTimeoutMs: number;
+  /**
+   * When false, keys without a passphrase unlock with no page. `undefined`
+   * means not set: off when every host is loopback, on otherwise.
+   */
+  readonly confirmUnencrypted: boolean | undefined;
   /** When true, every `ssh_run` shows Claude Code's permission dialog with the command in it. */
   readonly confirmEveryCommand: boolean;
   /** When true, the unlock page is opened in the default browser as well as linked. */
   readonly openBrowser: boolean;
+  /** The browser to open pages in; `undefined` means the system default. */
+  readonly browser: string | undefined;
   /** Loopback port for the unlock and approval pages; `0` means a fresh one each run. */
   readonly pagePort: number;
   readonly secrets: SecretsConfig;
@@ -180,11 +197,20 @@ export const SAMPLE_CONFIG = `# ssh-mcp.toml — every host this server may ever
 
 [vault]
 idle-timeout = "60m"     # relock (and drop sudo grants) after this much idle time
+# With no key encrypted, unlocking is a single click. false skips it. A key with
+# a passphrase still asks. Left out, the click is skipped only when every host
+# below is this machine (localhost, 127.x.x.x, ::1).
+# confirm-unencrypted = true
 
 [approval]
 # Show Claude Code's permission dialog, with the full command in it, before every
 # run. Useful while you are learning what the assistant actually does.
 confirm-every-command = false
+
+# Open the unlock and approval pages in this browser rather than the system
+# default: "Google Chrome" on macOS, "chrome" or a full path on Windows, a
+# command such as "firefox" on Linux. Leave it out to use the default.
+# browser = "Google Chrome"
 
 # The loopback port the unlock and approval pages are served on. Keep it stable:
 # your browser treats a new port as a new site, and offers to save the passphrase
@@ -288,8 +314,10 @@ export async function loadConfig(path: string = defaultConfigPath()): Promise<Co
     configPath: path,
     configDir: dirname(path),
     idleTimeoutMs: result.data.vault?.['idle-timeout'] ?? DEFAULT_IDLE_TIMEOUT_MS,
+    confirmUnencrypted: result.data.vault?.['confirm-unencrypted'],
     confirmEveryCommand: result.data.approval?.['confirm-every-command'] ?? false,
     openBrowser: result.data.approval?.['open-browser'] ?? true,
+    browser: result.data.approval?.browser,
     pagePort: result.data.approval?.['page-port'] ?? DEFAULT_PAGE_PORT,
     secrets: {
       redact: result.data.secrets?.redact ?? true,

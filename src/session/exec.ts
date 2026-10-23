@@ -114,7 +114,7 @@ fi
  * refused, and both are worth asking the user about rather than reporting raw.
  */
 const NEEDS_PASSWORD =
-  /password is required|no password was provided|incorrect password attempt|no tty present|a terminal is required|askpass/i;
+  /password is required|no password was provided|incorrect password attempt|no tty present|a terminal is required|interactive authentication is required|askpass/i;
 
 /** The shell preamble that teaches the far end how to authenticate this run's sudos. */
 export function sudoPrefix(mode: SudoMode): string {

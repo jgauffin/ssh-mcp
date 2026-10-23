@@ -1,3 +1,4 @@
+import { copyFile, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,6 +50,45 @@ describe('the vault starts locked and stays that way without a human', () => {
     expect(outcome.unlocked).toBe(true);
     expect(outcome.summary).toContain('1 key(s) could not be decrypted');
     expect(() => vault.keyFor(join(tmpdir(), 'ssh-mcp-absent'))).toThrow(/not available/);
+  });
+});
+
+describe('what unlocking needs', () => {
+  const plainKeyPath = join(FIXTURES, 'id_ed25519_plain');
+
+  it('is only consent when no key is encrypted, and stays locked until it is given', async () => {
+    const copy = join(await mkdtemp(join(tmpdir(), 'ssh-mcp-plain-')), 'id_second');
+    await copyFile(plainKeyPath, copy);
+    const vault = new Vault([plainKeyPath, copy], 60_000);
+
+    expect(await vault.unlockNeed()).toEqual({ kind: 'consent' });
+    expect(vault.locked).toBe(true);
+
+    // What the consent page submits.
+    const outcome = await vault.unlock('');
+    expect(outcome.unlocked).toBe(true);
+    expect(outcome.summary).toContain('2 key(s)');
+  });
+
+  it('is a passphrase when a key is encrypted', async () => {
+    expect(await new Vault([keyPath], 60_000).unlockNeed()).toEqual({ kind: 'passphrase' });
+  });
+
+  it('is a passphrase when only some keys are encrypted', async () => {
+    expect(await new Vault([plainKeyPath, keyPath], 60_000).unlockNeed()).toEqual({ kind: 'passphrase' });
+  });
+
+  it('names a malformed key, rather than asking for a passphrase', async () => {
+    const broken = join(await mkdtemp(join(tmpdir(), 'ssh-mcp-broken-')), 'key');
+    await writeFile(broken, 'not a key at all\n', 'utf8');
+    const need = await new Vault([plainKeyPath, broken], 60_000).unlockNeed();
+    expect(need.kind).toBe('broken');
+    expect(need.kind === 'broken' && need.summary).toContain(`${broken}: Unsupported key format`);
+  });
+
+  it('names an unreadable key', async () => {
+    const need = await new Vault([join(tmpdir(), 'ssh-mcp-absent')], 60_000).unlockNeed();
+    expect(need.kind === 'broken' && need.summary).toContain('cannot read key file');
   });
 });
 

@@ -412,13 +412,20 @@ function textResult(text: string, isError = false): CallToolResult {
   return { content: [{ type: 'text', text }], isError };
 }
 
-/** The passphrase form, shared by the native and the relayed-link paths. */
-function unlockForm(hostAliases: readonly string[]): { title: string; detail: string[]; fields: SecretField[] } {
-  return {
-    title: 'Unlock ssh-mcp',
-    detail: [`hosts: ${hostAliases.join(', ')}`],
-    fields: [{ name: 'passphrase', label: 'Key passphrase' }],
-  };
+/**
+ * The unlock form, shared by the native and the relayed-link paths.
+ *
+ * Unencrypted keys get the same page with no field: there is no secret to ask
+ * for, but opening the session is still the user's call.
+ */
+function unlockForm(
+  hostAliases: readonly string[],
+  need: 'passphrase' | 'consent',
+): { title: string; detail: string[]; fields: SecretField[] } {
+  const hosts = `hosts: ${hostAliases.join(', ')}`;
+  return need === 'passphrase'
+    ? { title: 'Unlock ssh-mcp', detail: [hosts], fields: [{ name: 'passphrase', label: 'Key passphrase' }] }
+    : { title: 'Unlock ssh-mcp', detail: [hosts, 'keys: unencrypted, nothing to type'], fields: [] };
 }
 
 /** Consumes a submitted passphrase; the returned message is shown on the page. */
@@ -492,11 +499,23 @@ export async function ensureUnlocked(
     return { ready: true };
   }
 
+  // A key that cannot be read or parsed is not fixed by a passphrase, so no page.
+  const need = await vault.unlockNeed();
+  if (need.kind === 'broken') return { ready: false, result: textResult(need.summary, true) };
+
+  // No passphrase and no click wanted: open it and carry on.
+  if (need.kind === 'none') {
+    const outcome = await vault.unlock('');
+    if (!outcome.unlocked) return { ready: false, result: textResult(outcome.summary, true) };
+    vault.touch();
+    return { ready: true };
+  }
+
   const noNativePrompt = urlElicitationUnavailable(ctx, capabilities, 'a key passphrase');
   if (noNativePrompt) {
     const { accepted, url, opened } = await collectNow(
       'unlock',
-      unlockForm(hostAliases),
+      unlockForm(hostAliases, need.kind),
       (values) => unlockWith(vault, values),
       openBrowser,
     );
@@ -522,7 +541,7 @@ export async function ensureUnlocked(
       if (answeredWithoutBeingAsked(state?.askedAt)) {
         const { accepted, url, opened } = await collectNow(
           'unlock',
-          unlockForm(hostAliases),
+          unlockForm(hostAliases, need.kind),
           (values) => unlockWith(vault, values),
           openBrowser,
         );
@@ -577,8 +596,11 @@ export async function ensureUnlocked(
         key: 'unlock',
         page: 'unlock',
         signal: ctx.mcpReq.signal,
-        message: 'ssh-mcp is locked. Open this page to enter your key passphrase — it is never sent to the model.',
-        ...unlockForm(hostAliases),
+        message:
+          need.kind === 'passphrase'
+            ? 'ssh-mcp is locked. Open this page to enter your key passphrase — it is never sent to the model.'
+            : 'ssh-mcp is locked. Open this page to unlock it.',
+        ...unlockForm(hostAliases, need.kind),
         onSubmit: (values) => unlockWith(vault, values),
       },
       mintState,

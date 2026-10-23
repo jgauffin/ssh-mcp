@@ -70,6 +70,8 @@ describe('recognising a sudo that wanted a password', () => {
     'sudo: a password is required',
     'sudo: 3 incorrect password attempts',
     'sudo: no tty present and no askpass program specified',
+    // sudo-rs, the default sudo from Ubuntu 26.04.
+    'sudo: interactive authentication is required',
   ])('recognises %j', (stderr) => {
     expect(refusedForPassword(stderr)).toBe(true);
   });

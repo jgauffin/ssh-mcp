@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `[approval].browser` opens the unlock and approval pages in a chosen browser instead of
+  the system default.
+- With no encrypted key, the unlock page has only an Unlock button. It used to demand a
+  passphrase that did not exist.
+- `[vault].confirm-unencrypted = false` skips that click. A key with a passphrase still asks.
+  Left out, the click is skipped only when every host is loopback.
+- A key that cannot be read or parsed fails the command and names the key, instead of
+  opening a passphrase page.
+
+### Fixed
+
+- sudo-rs (Ubuntu 26.04) says "interactive authentication is required" when it wants a
+  password. That went unrecognised, so the command failed instead of opening the password page.
+- The "Done" page said "return to Claude Code" whatever the client. It now names the client
+  from the handshake, or says "your MCP client", and has a close button.
+
 ## 0.2.0 (2026-10-06)
 
 ### Added

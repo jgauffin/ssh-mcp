@@ -256,10 +256,16 @@ nothing reaches SSH that is not named in it.
 ```toml
 [vault]
 idle-timeout = "60m"          # relock, and drop session sudo grants, after this idle
+# false: keys without a passphrase unlock with no page. Left out, that is the
+# default only when every host is this machine (localhost, 127.x.x.x, ::1).
+# confirm-unencrypted = true
 
 [approval]
 # Open the unlock page in your browser, rather than only printing its link.
 open-browser = true
+# Use this browser instead of the system default: "Google Chrome" on macOS,
+# "chrome" or a full path on Windows, a command such as "firefox" on Linux.
+# browser = "Google Chrome"
 # Also show your client's permission dialog before every *non*-sudo run. Off by
 # default; useful while you are learning what the assistant does. (Sudo always
 # prompts, via ssh_sudo, and is not affected by this.)
@@ -381,6 +387,12 @@ reported on the page with the form still there to retry. The browser waits for
 the vault to actually open before saying "Done", so a mistake never surfaces
 later as a puzzling failure. The command then runs, and nothing asks again until
 the idle timeout.
+
+With no encrypted key the page has no field, only an Unlock button. There is no
+secret to type, but opening the session is still your call. Set
+`confirm-unencrypted = false` under `[vault]` to skip that click. When every host
+is this machine, it is skipped unless you set it to `true`. A key that cannot be
+read or parsed opens no page: the command fails and names the key.
 
 Any `sudo` forces the assistant to `ssh_sudo`, which opens a page showing
 exactly what it wants to run:
