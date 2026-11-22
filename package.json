@@ -8,7 +8,7 @@
     "ssh-mcp": "./dist/main.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "scripts": {
     "build": "tsc",
@@ -19,17 +19,17 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.4.0",
     "ppk-to-openssh": "^3.2.0",
-    "smol-toml": "^1.7.1",
+    "smol-toml": "^1.9.1",
     "ssh2": "^1.17.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "^2.0.0",
-    "@types/node": "^22.10.0",
-    "@types/ssh2": "^1.15.0",
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@types/node": "^26.6.6",
+    "@types/ssh2": "^1.15.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.1"
   }
 }

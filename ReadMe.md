@@ -188,7 +188,7 @@ Scope, stated plainly:
 
 ## Install
 
-Requires **Node 22 or newer**, and Claude Code **2.1.199 or later** for the
+Requires **Node 22.12 or newer**, and Claude Code **2.1.199 or later** for the
 `requiresUserInteraction` annotation that the sudo prompt depends on.
 
 ```sh
